@@ -1,0 +1,107 @@
+/* frontend/src/App.css */
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f4f4f4; /* Light background */
+}
+
+.App {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.App-header {
+  background-color: #282c34;
+  padding: 15px 20px;
+  color: white;
+  text-align: center; /* Center header text */
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.main-content {
+  display: flex;
+  flex-grow: 1; /* Take remaining height */
+  padding: 15px;
+  gap: 15px; /* Space between columns */
+  flex-wrap: wrap; /* Allow wrapping on smaller screens */
+}
+
+.map-container-wrapper {
+  flex: 3; /* Map takes more space */
+  min-width: 300px; /* Ensure map has minimum width */
+  background-color: #fff;
+  padding: 15px;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.map-container-wrapper h2 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    color: #333;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 5px;
+}
+
+.sidebar {
+  flex: 1; /* Sidebar takes less space */
+  min-width: 250px; /* Ensure sidebar has minimum width */
+  display: flex;
+  flex-direction: column;
+  gap: 15px; /* Space between sidebar items */
+}
+
+.anomaly-panel, .density-placeholder, .selected-location-details {
+    background-color: #fff;
+    padding: 15px;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.anomaly-panel h2, .density-placeholder h2, .selected-location-details h3 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    color: #333;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 5px;
+}
+
+.anomaly-panel ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    max-height: 40vh; /* Limit height and allow scroll */
+    overflow-y: auto;
+}
+
+.anomaly-panel li {
+    border-bottom: 1px solid #eee;
+    padding: 8px 0;
+    font-size: 0.9em;
+}
+.anomaly-panel li:last-child {
+    border-bottom: none;
+}
+.anomaly-panel strong {
+    color: #c0392b; /* Reddish color for alert type */
+}
+
+
+/* Ensure Leaflet map renders correctly */
+.leaflet-container {
+  height: 60vh; /* Adjust height as needed within its container */
+  width: 100%; /* Take full width of its container */
+  border-radius: 6px;
+}
+
+/* Responsive adjustments (Example) */
+@media (max-width: 768px) {
+  .main-content {
+    flex-direction: column; /* Stack columns on smaller screens */
+  }
+}
