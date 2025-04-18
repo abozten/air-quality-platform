@@ -1,56 +1,159 @@
-# air-quality-platform/docker-compose.yml
-version: '3.8' # Specify compose file version
+# docker-compose.yml
+version: '3.8'
 
 services:
-  # --- TimescaleDB Service ---
-  timescaledb:
-    image: timescale/timescaledb-ha:pg16-latest # Use HA image for latest features like compression, pg16 is PostgreSQL 16
-    container_name: timescaledb_aq              # Optional: specific container name
+  ####################
+  # DATABASE SERVICE #
+  ####################
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb_service
     restart: unless-stopped
     ports:
-      # Map host port 5433 to container port 5432 (PostgreSQL default)
-      # Use 5433 to avoid conflict if you have PostgreSQL running locally on 5432
-      - "5433:5432"
-    environment:
-      POSTGRES_DB: air_quality_db         # Name of the database to create
-      POSTGRES_USER: aq_user              # Database user
-      POSTGRES_PASSWORD: your_strong_password # CHANGE THIS! Use a strong password. Consider using Docker secrets or .env file later.
-      # Optional: Add TS_TUNE_PROFILE=iot for IoT/sensor data workload tuning
-      # TS_TUNE_PROFILE: iot
+      - "${INFLUXDB_PORT:-8086}:8086"
     volumes:
-      # Persist database data using a named volume
-      - timescaledb_data:/var/lib/postgresql/data
+      - influxdb_data:/var/lib/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USERNAME:-admin}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD:-password} # Use secure password
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-airquality_org}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-airquality_data}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-admintoken} # Use secure token
     healthcheck:
-        # Simple check to see if postgres is ready to accept connections
-        test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+        test: ["CMD", "curl", "-f", "http://localhost:8086/ping"]
         interval: 10s
         timeout: 5s
         retries: 5
+    networks:
+      - air_quality_net
 
-  # --- Placeholder for your Backend Service (FastAPI) ---
-  # We will define this fully later when dockerizing the backend
-  backend:
-    build: ./backend # Assumes Dockerfile is in ./backend
-    container_name: backend_aq_api
+  #######################
+  # QUEUE SERVICE #
+  #######################
+  rabbitmq:
+    image: rabbitmq:3.11-management
+    container_name: rabbitmq_service
+    hostname: rabbitmq # Use this hostname for inter-service communication
     restart: unless-stopped
     ports:
-      - "8000:8000" # Map host 8000 to container 8000
-    environment:
-      # Pass database connection details as environment variables
-      # IMPORTANT: Use the service name 'timescaledb' as the host inside the Docker network
-      DATABASE_URL: postgresql+asyncpg://aq_user:your_strong_password@timescaledb:5432/air_quality_db # CHANGE PASSWORD! (using asyncpg driver)
-      # Or for psycopg2:
-      # DATABASE_URL: postgresql://aq_user:your_strong_password@timescaledb:5432/air_quality_db
-      # Add other necessary backend environment variables here
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672" # Management UI
     volumes:
-      - ./backend:/app # Mount backend code for development (remove for production builds)
+      - rabbitmq_data:/var/lib/rabbitmq/
+    environment:
+      # Use secure credentials from .env or defaults here
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-user}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-password}
+    healthcheck:
+        test: ["CMD", "rabbitmq-diagnostics", "ping", "-q"]
+        interval: 15s
+        timeout: 10s
+        retries: 5
+    networks:
+      - air_quality_net
+
+  #######################
+  # BACKEND API SERVICE #
+  #######################
+  backend_api:
+    build:
+      context: ./backend # Path to directory containing Dockerfile
+      dockerfile: Dockerfile
+    container_name: backend_api_service
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_API_PORT:-8000}:8000" # Expose API port
+    volumes:
+      # Mount code for development hot-reloading
+      # Note: Ensure paths match your local structure relative to docker-compose.yml
+      - ./backend/app:/app/app
+    env_file:
+      - .env # Load variables from .env file first
+    environment:
+      # Override or provide specific variables needed by the API
+      # Use service names for inter-container communication
+      - INFLUXDB_URL=http://influxdb:${INFLUXDB_PORT:-8086} # Use 'influxdb' service name
+      - RABBITMQ_HOST=rabbitmq # Use 'rabbitmq' service name
+      # Other variables like INFLUXDB_TOKEN, _ORG, _BUCKET, RABBITMQ_USER, _PASS, _QUEUE_RAW
+      # will be loaded from .env via env_file
+      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
     depends_on:
-      timescaledb: # Ensure DB starts (and ideally is healthy) before backend
-        condition: service_healthy # Use the healthcheck result
+      influxdb:
+        condition: service_healthy # Wait for InfluxDB to be ready
+      rabbitmq:
+        condition: service_healthy # Wait for RabbitMQ to be ready
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload # Run FastAPI with reload
+    networks:
+      - air_quality_net
 
-# --- Define Named Volumes ---
+  #########################
+  # BACKEND WORKER SERVICE #
+  #########################
+  backend_worker:
+    build:
+      context: ./backend # Can reuse the same backend Dockerfile
+      dockerfile: Dockerfile
+    container_name: backend_worker_service
+    restart: unless-stopped
+    volumes:
+      # Mount code for development (if changes in worker logic need hot reload - requires careful setup)
+      # Or just rely on rebuilding the image for worker changes
+      - ./backend/app:/app/app
+    env_file:
+      - .env # Load base environment variables
+    environment:
+      # Override or provide specific variables needed by the worker
+      - INFLUXDB_URL=http://influxdb:${INFLUXDB_PORT:-8086}
+      - RABBITMQ_HOST=rabbitmq
+      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
+      # Worker-specific settings if any
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: python app/worker.py # Command to start the worker script
+    networks:
+      - air_quality_net
+
+  ##########################
+  # FRONTEND SERVICE (Dev) #
+  ##########################
+  frontend:
+    build:
+      context: ./frontend # Path to directory containing frontend Dockerfile
+      dockerfile: Dockerfile
+    container_name: frontend_service
+    ports:
+      - "${FRONTEND_DEV_PORT:-5173}:5173" # Map Vite's default dev port
+    volumes:
+      # Mount source code for hot-reloading during development
+      - ./frontend:/app
+      # Use a named volume for node_modules to avoid overwriting container's modules
+      # This improves performance and avoids platform issues
+      - frontend_node_modules:/app/node_modules
+    env_file:
+      - .env # Load VITE_API_BASE_URL etc.
+    environment:
+       # Pass the API URL for the frontend to use (needs VITE_ prefix for Vite)
+       # Ensure VITE_API_BASE_URL is defined in your .env file correctly (e.g., http://localhost:8000/api/v1)
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL}
+      - NODE_ENV=development # Indicate development mode
+    # depends_on: # Optional: Frontend doesn't strictly need backend running to start dev server
+    #   - backend_api
+    networks:
+      - air_quality_net
+
+
 volumes:
-  timescaledb_data: # Docker will manage this volume
+  influxdb_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  frontend_node_modules: # Named volume for frontend node_modules
+    driver: local
 
-# --- Placeholder for Frontend Service ---
-# We will add the frontend service definition here later
+networks:
+  air_quality_net:
+    driver: bridge # Default bridge network for communication

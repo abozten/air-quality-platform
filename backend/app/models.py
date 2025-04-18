@@ -1,7 +1,18 @@
 # backend/app/models.py
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone # Ensure timezone is imported
+
+class IngestRequest(BaseModel):
+    # Timestamp is optional in request, will default to now if not provided
+    # Alternatively, you could make it mandatory from the script
+    latitude: float = Field(..., example=51.5074)
+    longitude: float = Field(..., example=-0.1278)
+    pm25: Optional[float] = Field(None, example=12.5)
+    pm10: Optional[float] = Field(None, example=25.0)
+    no2: Optional[float] = Field(None, example=30.1)
+    so2: Optional[float] = Field(None, example=5.5)
+    o3: Optional[float] = Field(None, example=45.8)
 
 class AirQualityReading(BaseModel):
     latitude: float = Field(..., example=51.5074)
