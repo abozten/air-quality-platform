@@ -1,0 +1,56 @@
+# air-quality-platform/docker-compose.yml
+version: '3.8' # Specify compose file version
+
+services:
+  # --- TimescaleDB Service ---
+  timescaledb:
+    image: timescale/timescaledb-ha:pg16-latest # Use HA image for latest features like compression, pg16 is PostgreSQL 16
+    container_name: timescaledb_aq              # Optional: specific container name
+    restart: unless-stopped
+    ports:
+      # Map host port 5433 to container port 5432 (PostgreSQL default)
+      # Use 5433 to avoid conflict if you have PostgreSQL running locally on 5432
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: air_quality_db         # Name of the database to create
+      POSTGRES_USER: aq_user              # Database user
+      POSTGRES_PASSWORD: your_strong_password # CHANGE THIS! Use a strong password. Consider using Docker secrets or .env file later.
+      # Optional: Add TS_TUNE_PROFILE=iot for IoT/sensor data workload tuning
+      # TS_TUNE_PROFILE: iot
+    volumes:
+      # Persist database data using a named volume
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+        # Simple check to see if postgres is ready to accept connections
+        test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+  # --- Placeholder for your Backend Service (FastAPI) ---
+  # We will define this fully later when dockerizing the backend
+  backend:
+    build: ./backend # Assumes Dockerfile is in ./backend
+    container_name: backend_aq_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # Map host 8000 to container 8000
+    environment:
+      # Pass database connection details as environment variables
+      # IMPORTANT: Use the service name 'timescaledb' as the host inside the Docker network
+      DATABASE_URL: postgresql+asyncpg://aq_user:your_strong_password@timescaledb:5432/air_quality_db # CHANGE PASSWORD! (using asyncpg driver)
+      # Or for psycopg2:
+      # DATABASE_URL: postgresql://aq_user:your_strong_password@timescaledb:5432/air_quality_db
+      # Add other necessary backend environment variables here
+    volumes:
+      - ./backend:/app # Mount backend code for development (remove for production builds)
+    depends_on:
+      timescaledb: # Ensure DB starts (and ideally is healthy) before backend
+        condition: service_healthy # Use the healthcheck result
+
+# --- Define Named Volumes ---
+volumes:
+  timescaledb_data: # Docker will manage this volume
+
+# --- Placeholder for Frontend Service ---
+# We will add the frontend service definition here later

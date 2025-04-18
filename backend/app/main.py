@@ -3,6 +3,28 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from datetime import datetime
+from contextlib import asynccontextmanager
+import logging
+
+# Import database connection functions
+from .database import connect_to_db, close_db_connection, get_db_pool, DATABASE_URL
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Use lifespan context manager for startup/shutdown events
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    logger.info("Application startup...")
+    await connect_to_db() # Establish DB pool
+    yield # Application runs here
+    # Shutdown logic
+    logger.info("Application shutdown...")
+    await close_db_connection() # Close DB pool
+
+
 
 # Import models and dummy data functions
 from .models import AirQualityReading, Anomaly, PollutionDensity
@@ -39,8 +61,10 @@ API_PREFIX = "/api/v1"
 
 @app.get("/")
 async def read_root():
-    """ Basic endpoint to check if the API is running. """
-    return {"message": "Welcome to the Air Quality API!"}
+    # Check DB connection status (optional)
+    pool = await get_db_pool()
+    db_status = "Connected" if pool else "Disconnected"
+    return {"message": "Welcome to the Air Quality API!", "database_status": db_status}
 
 @app.get(f"{API_PREFIX}/air_quality/location", response_model=AirQualityReading)
 async def get_air_quality_for_location(
