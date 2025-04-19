@@ -112,7 +112,7 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: python app/worker.py # Command to start the worker script
+    command: python -m app.worker # Command to start the worker script
     networks:
       - air_quality_net
 
