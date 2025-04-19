@@ -4,4 +4,4 @@ uvicorn[standard]>=0.20.0
 python-dotenv>=1.0.0
 pydantic-settings>=2.0.0
 influxdb-client[ciso]>=1.36.0 # Make sure this or similar is present
-pika>=1.3.0
+aio-pika>=9.5.5

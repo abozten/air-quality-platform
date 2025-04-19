@@ -22,18 +22,17 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Code to run on startup
     logger.info("API Startup: Initializing resources...")
-    # Pool is initialized globally in queue_client.py when imported
+    # Initialize RabbitMQ connection pool
+    await queue_client.initialize_rabbitmq_pool()
+    # Initialize other resources if needed (e.g., async InfluxDB client)
     yield
-    # Code to run on shutdown
     logger.info("API Shutdown: Cleaning up resources...")
-    # Close InfluxDB connection
+    # Close RabbitMQ connection pool
+    await queue_client.close_rabbitmq_pool()
+    # Close InfluxDB connection (synchronous for now)
     db_client.close_influx_client()
-    # Close RabbitMQ connections in the pool (NEW)
-    logger.info("Closing RabbitMQ connection pool...")
-    queue_client.connection_pool.close_all() # Call the pool's cleanup method
-    logger.info("RabbitMQ connection pool closed.")
+    logger.info("Resource cleanup finished.")
 
 # Update FastAPI app instance to use lifespan manager
 app = FastAPI(
@@ -146,39 +145,27 @@ async def get_pollution_density_for_bbox(
 
 @app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_air_quality_data(
-    ingest_data: IngestRequest = Body(...) # Get data from request body
+    ingest_data: IngestRequest = Body(...)
 ):
     """
-    Receives a single air quality data point and writes it to the database.
-    Assigns current UTC timestamp upon ingestion.
+    Receives data, validates, and publishes ASYNCHRONOUSLY to the queue via connection pool.
     """
-    logger.info(f"Received ingest request: {ingest_data.model_dump()}") # Use model_dump()
+    logger.info(f"API: Async Pool Received ingest request: {ingest_data.model_dump()}")
 
-    # Create the full AirQualityReading object, adding the timestamp
-    reading = AirQualityReading(
-        latitude=ingest_data.latitude,
-        longitude=ingest_data.longitude,
-        timestamp=datetime.now(timezone.utc), # Assign current UTC time
-        pm25=ingest_data.pm25,
-        pm10=ingest_data.pm10,
-        no2=ingest_data.no2,
-        so2=ingest_data.so2,
-        o3=ingest_data.o3
-    )
-
-    # Write data using the db_client function
-    success = write_air_quality_data(reading)
+    # Call the publish function which now uses the pool
+    success = await queue_client.publish_message_async(ingest_data.model_dump())
 
     if success:
-        logger.info(f"Successfully ingested data for {reading.latitude}, {reading.longitude}")
-        return {"message": "Data point accepted"}
+        # Log less verbosely on success perhaps
+        # logger.info(f"API: Async Pool published data for {ingest_data.latitude}, {ingest_data.longitude}")
+        return {"message": "Data point accepted for processing"}
     else:
-        logger.error(f"Failed to ingest data for {reading.latitude}, {reading.longitude}")
-        # Return 500 Internal Server Error if writing failed
+        logger.error(f"API: Async Pool FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to write data to the database."
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to queue data for processing after retries. Service may be temporarily unavailable."
         )
+
     
 # --- Update Endpoint ---
 @app.get(f"{API_PREFIX}/air_quality/location", response_model=Optional[AirQualityReading]) # Response can be None now
