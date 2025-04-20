@@ -9,6 +9,7 @@ function App() {
   const [mapPoints, setMapPoints] = useState([]);
   const [anomalies, setAnomalies] = useState([]);
   const [selectedLocationData, setSelectedLocationData] = useState(null);
+  const [selectedParam, setSelectedParam] = useState('pm25'); // Default to PM2.5
   const [isLoadingPoints, setIsLoadingPoints] = useState(false);
   const [isLoadingAnomalies, setIsLoadingAnomalies] = useState(false);
   const [errorPoints, setErrorPoints] = useState(null);
@@ -21,7 +22,7 @@ function App() {
       setIsLoadingPoints(true);
       setErrorPoints(null);
       try {
-        const pointsData = await api.fetchAirQualityPoints(50); // Fetch 50 points
+        const pointsData = await api.fetchAirQualityPoints(200); // Fetch 200 points
         setMapPoints(pointsData);
       } catch (err) {
         console.error("Failed to fetch map points:", err);
@@ -58,6 +59,10 @@ function App() {
     // setSelectedLocationData(detailedData);
   };
 
+  const handleParamChange = (event) => {
+    setSelectedParam(event.target.value);
+  };
+
    // Function to handle clicks directly on the map (optional)
    const handleMapClick = (latlng) => {
        console.log("Map clicked at:", latlng);
@@ -73,43 +78,42 @@ function App() {
 
       <div className="main-content">
         <div className="map-container-wrapper">
-          <h2>Air Quality Map</h2>
+
+          {/* **************************************** */}
+          {/* Parameter Selection Dropdown */}
+          <div className="parameter-selector">
+            <label htmlFor="param-select">Heatmap Parameter: </label>
+            <select id="param-select" value={selectedParam} onChange={handleParamChange}>
+              <option value="pm25">PM2.5</option>
+              <option value="pm10">PM10</option>
+              <option value="no2">NO₂</option>
+              <option value="so2">SO₂</option>
+              <option value="o3">O₃</option>
+            </select>
+          </div>
+          {/* **************************************** */}
+
+          <h2>Air Quality Heatmap ({selectedParam.toUpperCase()})</h2> {/* Dynamic Title */}
           {isLoadingPoints && <p>Loading map data...</p>}
           {errorPoints && <p style={{ color: 'red' }}>Error loading map data: {errorPoints}</p>}
+
+          {/* **************************************** */}
+          {/* Pass selectedParam down to MapComponent */}
           <MapComponent
-                points={mapPoints}
-                onMarkerClick={handleMarkerClick}
-                // onMapClick={handleMapClick} // Pass handler if using map click events
-           />
-           {/* Placeholder for selected location details */}
-           {/* {selectedLocationData && (
-               <div className="selected-location-details">
-                   <h3>Details for Clicked Location</h3>
-                   <pre>{JSON.stringify(selectedLocationData, null, 2)}</pre>
-               </div>
-           )} */}
+            points={mapPoints}
+            selectedParam={selectedParam} // Pass the state down
+          />
+          {/* **************************************** */}
+
         </div>
 
         <div className="sidebar">
-           <AnomalyPanel
-              anomalies={anomalies}
-              isLoading={isLoadingAnomalies}
-              error={errorAnomalies}
-           />
-           {/* Placeholder for graphs or other controls */}
-           <div className="density-placeholder">
-                <h2>Pollution Density (Future)</h2>
-                <p>Region selection and density display will go here.</p>
-                {/* Example button to test density endpoint */}
-                <button onClick={async () => {
-                    try {
-                        const density = await api.fetchPollutionDensity("London");
-                        alert(`Fetched Density for London: ${JSON.stringify(density)}`);
-                    } catch (error) {
-                        alert(`Error fetching density: ${error.message}`);
-                    }
-                }}>Test Fetch Density (London)</button>
-           </div>
+          <AnomalyPanel
+            anomalies={anomalies}
+            isLoading={isLoadingAnomalies}
+            error={errorAnomalies}
+          />
+          {/* ... other sidebar content ... */}
         </div>
       </div>
     </div>

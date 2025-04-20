@@ -3,10 +3,8 @@ import React, { useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
-// Import the heatmap plugin AFTER Leaflet
-import 'leaflet.heat'; // This imports the JS and expects L to be global
+import 'leaflet.heat';
 
-// --- Icon Fix (Still needed if you add markers back later) ---
 import iconRetinaUrl from 'leaflet/dist/images/marker-icon-2x.png';
 import iconUrl from 'leaflet/dist/images/marker-icon.png';
 import shadowUrl from 'leaflet/dist/images/marker-shadow.png';
@@ -14,76 +12,87 @@ delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
     iconRetinaUrl: iconRetinaUrl, iconUrl: iconUrl, shadowUrl: shadowUrl,
 });
-// --- End Icon Fix ---
 
 
-// Internal component to handle the heatmap layer logic
-const HeatmapLayer = ({ points }) => {
-    const map = useMap(); // Get the map instance from the parent MapContainer
-    const heatLayerRef = useRef(null); // Ref to store the heatmap layer
+
+const HeatmapLayer = ({ points, selectedParam }) => { // Added selectedParam prop
+    const map = useMap();
+    const heatLayerRef = useRef(null);
 
     useEffect(() => {
-        // Ensure map instance exists
         if (!map) return;
 
-        // 1. Format data for leaflet.heat: array of [lat, lng, intensity]
-        // We'll use pm10 as intensity. Filter out points without valid pm10 data.
+        // 1. Filter points and extract data based on selectedParam
         const heatPoints = points
-            .filter(p => p.latitude != null && p.longitude != null && p.pm10 != null && !isNaN(p.pm10))
-            .map(p => [p.latitude, p.longitude, p.pm10]);
+            .filter(p =>
+                p.latitude != null &&
+                p.longitude != null &&
+                p[selectedParam] != null && // Check the selected parameter
+                !isNaN(p[selectedParam])     // Ensure it's a number
+            )
+            .map(p => [p.latitude, p.longitude, p[selectedParam]]); // Use selectedParam value
 
-        // If no valid points, potentially remove existing layer or do nothing
         if (heatPoints.length === 0) {
-             if (heatLayerRef.current) {
+            // Remove layer if no valid points for the selected param
+            if (heatLayerRef.current) {
                 map.removeLayer(heatLayerRef.current);
                 heatLayerRef.current = null;
-             }
-             return;
+            }
+            return;
         }
 
-        // 2. Configure heatmap options
+        // 2. Define dynamic max intensity based on parameter
+        let maxIntensity;
+        switch (selectedParam) {
+            case 'pm10': maxIntensity = 100.0; break;
+            case 'no2': maxIntensity = 80.0; break;
+            case 'so2': maxIntensity = 40.0; break;
+            case 'o3': maxIntensity = 150.0; break;
+            case 'pm25': // fallthrough intentional
+            default: maxIntensity = 50.0; break; // Default for PM2.5
+        }
+
+        // 3. Configure heatmap options dynamically
         const heatOptions = {
-            radius: 25,         // Radius of each point's influence
-            blur: 15,           // Amount of blur
-            maxZoom: 18,        // Zoom level where heatmap disappears
-            max: 50.0,          // Max intensity value (adjust based on expected PM2.5 range)
-            gradient: {         // Color gradient (0.0 = transparent, 1.0 = max color)
-                0.4: 'blue',    // ~20 µg/m³
-                0.6: 'cyan',    // ~30 µg/m³
-                0.7: 'lime',    // ~35 µg/m³
-                0.8: 'yellow',  // ~40 µg/m³
-                1.0: 'red'      // >=50 µg/m³ (or your defined max)
+            radius: 20, // Slightly smaller radius might look better with more points
+            blur: 15,
+            maxZoom: 18,
+            max: maxIntensity, // Use dynamic max intensity
+            gradient: { // Keep or adjust gradient as needed
+                0.4: 'blue',
+                0.6: 'cyan',
+                0.7: 'lime',
+                0.8: 'yellow',
+                1.0: 'red'
             }
         };
 
-        // 3. Add or update the heatmap layer
+        // 4. Add or update the layer
         if (heatLayerRef.current) {
-            // If layer exists, update its data and options
-            heatLayerRef.current.setLatLngs(heatPoints);
-            heatLayerRef.current.setOptions(heatOptions);
+            heatLayerRef.current.setLatLngs(heatPoints); // Update data
+            heatLayerRef.current.setOptions(heatOptions); // Update options (like max intensity)
         } else {
-            // If layer doesn't exist, create it and add to map
             heatLayerRef.current = L.heatLayer(heatPoints, heatOptions);
             heatLayerRef.current.addTo(map);
         }
 
-        // 4. Cleanup function: Remove layer when component unmounts or points change drastically
-        // This cleanup function runs before the next useEffect runs or when the component unmounts
+        // 5. Cleanup
         return () => {
             if (heatLayerRef.current) {
                 map.removeLayer(heatLayerRef.current);
-                heatLayerRef.current = null; // Clear the ref
+                heatLayerRef.current = null;
             }
         };
+        // ****************************************
+        // Add selectedParam to dependency array
+    }, [map, points, selectedParam]);
+    // ****************************************
 
-    }, [map, points]); // Re-run effect if map instance or points data changes
-
-    return null; // This component doesn't render anything itself
+    return null;
 };
 
-
-// Main Map Component
-const MapComponent = ({ points = [] }) => { // Removed onMarkerClick/onMapClick for now
+// Accept selectedParam and pass it down
+const MapComponent = ({ points = [], selectedParam }) => {
     const initialPosition = [20, 0];
     const initialZoom = 3;
 
@@ -93,17 +102,8 @@ const MapComponent = ({ points = [] }) => { // Removed onMarkerClick/onMapClick 
                 attribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
-
-            {/* Render the HeatmapLayer component, passing the points data */}
-            <HeatmapLayer points={points} />
-
-            {/* Markers removed for now to show heatmap clearly */}
-            {/* {points.map((point, index) => (
-                <Marker key={index} position={[point.latitude, point.longitude]}>
-                    <Popup>{`PM2.5: ${point.pm10 ?? 'N/A'}`}</Popup>
-                </Marker>
-            ))} */}
-
+            {/* Pass selectedParam to HeatmapLayer */}
+            <HeatmapLayer points={points} selectedParam={selectedParam} />
         </MapContainer>
     );
 };

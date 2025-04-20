@@ -11,7 +11,7 @@ const handleResponse = async (response) => {
 };
 
 // Fetch multiple air quality data points for the map
-export const fetchAirQualityPoints = async (limit = 50) => {
+export const fetchAirQualityPoints = async (limit = 5000) => {
   const response = await fetch(`${API_BASE_URL}/air_quality/points?limit=${limit}`);
   return handleResponse(response);
 };
