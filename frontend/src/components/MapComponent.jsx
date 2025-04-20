@@ -1,75 +1,111 @@
 // frontend/src/components/MapComponent.jsx
-import React from 'react';
-import { MapContainer, TileLayer, Marker, Popup, useMapEvents } from 'react-leaflet';
+import React, { useEffect, useRef } from 'react';
+import { MapContainer, TileLayer, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+// Import the heatmap plugin AFTER Leaflet
+import 'leaflet.heat'; // This imports the JS and expects L to be global
+
+// --- Icon Fix (Still needed if you add markers back later) ---
 import iconRetinaUrl from 'leaflet/dist/images/marker-icon-2x.png';
 import iconUrl from 'leaflet/dist/images/marker-icon.png';
 import shadowUrl from 'leaflet/dist/images/marker-shadow.png';
-
-// --- Icon Fix ---
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
     iconRetinaUrl: iconRetinaUrl, iconUrl: iconUrl, shadowUrl: shadowUrl,
 });
 // --- End Icon Fix ---
 
-// Helper to format popup content
-const formatPopupContent = (point) => {
-    return `
-        <b>Location:</b> (${point.latitude.toFixed(2)}, ${point.longitude.toFixed(2)})<br/>
-        <b>PM2.5:</b> ${point.pm25 ?? 'N/A'} µg/m³<br/>
-        <b>PM10:</b> ${point.pm10 ?? 'N/A'} µg/m³<br/>
-        <b>NO₂:</b> ${point.no2 ?? 'N/A'} µg/m³<br/>
-        <b>SO₂:</b> ${point.so2 ?? 'N/A'} µg/m³<br/>
-        <b>O₃:</b> ${point.o3 ?? 'N/A'} µg/m³<br/>
-        <b>Time:</b> ${new Date(point.timestamp).toLocaleString()}
-    `;
+
+// Internal component to handle the heatmap layer logic
+const HeatmapLayer = ({ points }) => {
+    const map = useMap(); // Get the map instance from the parent MapContainer
+    const heatLayerRef = useRef(null); // Ref to store the heatmap layer
+
+    useEffect(() => {
+        // Ensure map instance exists
+        if (!map) return;
+
+        // 1. Format data for leaflet.heat: array of [lat, lng, intensity]
+        // We'll use pm10 as intensity. Filter out points without valid pm10 data.
+        const heatPoints = points
+            .filter(p => p.latitude != null && p.longitude != null && p.pm10 != null && !isNaN(p.pm10))
+            .map(p => [p.latitude, p.longitude, p.pm10]);
+
+        // If no valid points, potentially remove existing layer or do nothing
+        if (heatPoints.length === 0) {
+             if (heatLayerRef.current) {
+                map.removeLayer(heatLayerRef.current);
+                heatLayerRef.current = null;
+             }
+             return;
+        }
+
+        // 2. Configure heatmap options
+        const heatOptions = {
+            radius: 25,         // Radius of each point's influence
+            blur: 15,           // Amount of blur
+            maxZoom: 18,        // Zoom level where heatmap disappears
+            max: 50.0,          // Max intensity value (adjust based on expected PM2.5 range)
+            gradient: {         // Color gradient (0.0 = transparent, 1.0 = max color)
+                0.4: 'blue',    // ~20 µg/m³
+                0.6: 'cyan',    // ~30 µg/m³
+                0.7: 'lime',    // ~35 µg/m³
+                0.8: 'yellow',  // ~40 µg/m³
+                1.0: 'red'      // >=50 µg/m³ (or your defined max)
+            }
+        };
+
+        // 3. Add or update the heatmap layer
+        if (heatLayerRef.current) {
+            // If layer exists, update its data and options
+            heatLayerRef.current.setLatLngs(heatPoints);
+            heatLayerRef.current.setOptions(heatOptions);
+        } else {
+            // If layer doesn't exist, create it and add to map
+            heatLayerRef.current = L.heatLayer(heatPoints, heatOptions);
+            heatLayerRef.current.addTo(map);
+        }
+
+        // 4. Cleanup function: Remove layer when component unmounts or points change drastically
+        // This cleanup function runs before the next useEffect runs or when the component unmounts
+        return () => {
+            if (heatLayerRef.current) {
+                map.removeLayer(heatLayerRef.current);
+                heatLayerRef.current = null; // Clear the ref
+            }
+        };
+
+    }, [map, points]); // Re-run effect if map instance or points data changes
+
+    return null; // This component doesn't render anything itself
 };
 
-// Component to handle map clicks (optional, for future use)
-const LocationMarker = ({ onMapClick }) => {
-    useMapEvents({
-        click(e) {
-            onMapClick(e.latlng); // Pass coordinates back up
-        },
-    });
-    return null; // Doesn't render anything visible
-};
 
+// Main Map Component
+const MapComponent = ({ points = [] }) => { // Removed onMarkerClick/onMapClick for now
+    const initialPosition = [20, 0];
+    const initialZoom = 3;
 
-const MapComponent = ({ points = [], onMarkerClick, onMapClick }) => {
-  const initialPosition = [20, 0]; // Center map more globally
-  const initialZoom = 3;
+    return (
+        <MapContainer center={initialPosition} zoom={initialZoom} style={{ height: '70vh', width: '100%' }}>
+            <TileLayer
+                attribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            />
 
-  const handleMarkerClick = (point) => {
-    if(onMarkerClick) {
-        onMarkerClick(point); // Pass the clicked point's data
-    }
-  }
+            {/* Render the HeatmapLayer component, passing the points data */}
+            <HeatmapLayer points={points} />
 
-  return (
-    <MapContainer center={initialPosition} zoom={initialZoom} style={{ height: '60vh', width: '100%' }}>
-      <TileLayer
-        attribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-      />
-       {/* <LocationMarker onMapClick={onMapClick} /> */} {/* Enable if you want map click events */}
+            {/* Markers removed for now to show heatmap clearly */}
+            {/* {points.map((point, index) => (
+                <Marker key={index} position={[point.latitude, point.longitude]}>
+                    <Popup>{`PM2.5: ${point.pm10 ?? 'N/A'}`}</Popup>
+                </Marker>
+            ))} */}
 
-      {points.map((point, index) => (
-        <Marker
-            key={index} // Use a more stable key if available (e.g., point.id)
-            position={[point.latitude, point.longitude]}
-            eventHandlers={{
-                click: () => handleMarkerClick(point),
-            }}
-        >
-          <Popup>{formatPopupContent(point)}</Popup>
-        </Marker>
-      ))}
-      {/* Heatmap layer or anomaly markers will be added here later */}
-    </MapContainer>
-  );
+        </MapContainer>
+    );
 };
 
 export default MapComponent;
