@@ -4,17 +4,13 @@ from typing import List, Optional
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 import logging
+from .config import get_settings # Use get_settings() here
 from fastapi import FastAPI, Query, HTTPException, Body, status
-from .models import IngestRequest, AirQualityReading
-from .db_client import (
-    query_latest_location_data,
-    close_influx_client,
-    write_air_quality_data
-)
-from . import db_client
-from . import queue_client
+from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity # Import all necessary models
+from . import db_client # Import db_client module
+from . import queue_client # Import queue_client module
 
-
+settings = get_settings() # Get settings
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -25,12 +21,13 @@ async def lifespan(app: FastAPI):
     logger.info("API Startup: Initializing resources...")
     # Initialize RabbitMQ connection pool
     await queue_client.initialize_rabbitmq_pool()
-    # Initialize other resources if needed (e.g., async InfluxDB client)
+    # Initialize InfluxDB client (call the init function from db_client)
+    db_client.initialize_influxdb_client()
     yield
     logger.info("API Shutdown: Cleaning up resources...")
     # Close RabbitMQ connection pool
     await queue_client.close_rabbitmq_pool()
-    # Close InfluxDB connection (synchronous for now)
+    # Close InfluxDB connection
     db_client.close_influx_client()
     logger.info("Resource cleanup finished.")
 
@@ -42,25 +39,13 @@ app = FastAPI(
     lifespan=lifespan # Add lifespan manager
 )
 
-
-
-# Import models and dummy data functions
-from .models import AirQualityReading, Anomaly, PollutionDensity
-from .dummy_data import (
-    create_dummy_air_quality,
-    create_multiple_dummy_readings,
-    create_dummy_anomalies,
-    create_dummy_pollution_density
-)
-
-
-
 # --- CORS Configuration ---
 origins = [
     "http://localhost:3000",
     "localhost:3000",
     "http://localhost:5173", # Vite default port
     "localhost:5173",
+    # Add other frontend origins if needed
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -73,48 +58,117 @@ app.add_middleware(
 # --- API Endpoints ---
 API_PREFIX = "/api/v1"
 
-# Import the new query functions
-from .db_client import (
-    query_latest_location_data,
-    query_recent_points,
-    query_anomalies_from_db,
-    query_density_in_bbox,
-    close_influx_client
-)
+# Note: The provided main.py had a duplicate definition of get_multiple_air_quality_points.
+# I've removed the first (dummy) one and kept/updated the second one to use db_client.
+# Also, the dummy pollution_density endpoint was removed and replaced with the bbox version.
 
-# --- Endpoint for Multiple Points ---
+@app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_air_quality_data(
+    ingest_data: IngestRequest = Body(...)
+):
+    """
+    Receives air quality data, validates, and publishes ASYNCHRONOUSLY to the raw data queue
+    for processing by the worker.
+    """
+    logger.info(f"API: Received ingest request for {ingest_data.latitude},{ingest_data.longitude}")
+
+    # Call the publish function which uses the connection pool
+    success = await queue_client.publish_message_async(ingest_data.model_dump())
+
+    if success:
+        logger.debug(f"API: Published data for {ingest_data.latitude}, {ingest_data.longitude} to queue.")
+        return {"message": "Data point accepted and queued for processing"}
+    else:
+        logger.error(f"API: FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude} to queue.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to queue data for processing after retries. Message queue service may be temporarily unavailable."
+        )
+
+@app.get(f"{API_PREFIX}/air_quality/location", response_model=Optional[AirQualityReading])
+async def get_air_quality_for_location(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude of the location"),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude of the location")
+):
+    """
+    Get the latest air quality data for a specific location from InfluxDB.
+    Searches within the last hour by default. Returns null if no recent data is found.
+    """
+    logger.info(f"API: Request received for latest data at lat={lat}, lon={lon}")
+    # Call the database query function
+    reading = db_client.query_latest_location_data(lat=lat, lon=lon, window="1h")
+
+    if reading is None:
+         logger.info(f"API: No recent data found for {lat},{lon}.")
+         # Returning None automatically results in 200 with null body for Optional[...]
+         return None
+
+    logger.debug(f"API: Found latest reading for {lat},{lon}")
+    return reading
+
+# --- Endpoint for Multiple Recent Points ---
+# This replaces the dummy get_multiple_air_quality_points
 @app.get(f"{API_PREFIX}/air_quality/points", response_model=List[AirQualityReading])
 async def get_multiple_air_quality_points(
     limit: int = Query(50, gt=0, le=200, description="Max number of distinct location points to return"),
-    window: str = Query("1h", description="Time window to look for latest data (e.g., '1h', '24h', '5m')")
+    window: str = Query("1h", description="Time window to look for latest data (e.g., '1h', '24h', '5m')"),
+    # Added optional bbox filters, aligning with the concept from the removed duplicate endpoint
+    min_lat: Optional[float] = Query(None, ge=-90, le=90, description="Minimum latitude for bounding box"),
+    max_lat: Optional[float] = Query(None, ge=-90, le=90, description="Maximum latitude for bounding box"),
+    min_lon: Optional[float] = Query(None, ge=-180, le=180, description="Minimum longitude for bounding box"),
+    max_lon: Optional[float] = Query(None, ge=-180, le=180, description="Maximum longitude for bounding box")
 ):
     """
-    Get a list of recent air quality readings from distinct locations stored in InfluxDB.
+    Get a list of recent air quality readings from distinct locations stored in InfluxDB,
+    optionally filtered by a bounding box.
     """
-    logger.info(f"Request received for recent points: limit={limit}, window={window}")
-    readings = query_recent_points(limit=limit, window=window)
-    if readings is None: # query_recent_points now returns list or empty list
+    logger.info(f"API: Request received for recent points: limit={limit}, window={window}, bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}]")
+
+    # Note: The current db_client.query_recent_points function doesn't support bbox filtering.
+    # This endpoint definition *includes* bbox parameters, suggesting a potential future enhancement
+    # in db_client. For now, the bbox parameters will be accepted but ignored by the current db_client function.
+    # If bbox filtering is critical, db_client.query_recent_points would need modification.
+    if any([min_lat, max_lat, min_lon, max_lon]) and not all([min_lat, max_lat, min_lon, max_lon]):
+         raise HTTPException(status_code=400, detail="If any bounding box parameter is provided, all must be provided.")
+    if all([min_lat, max_lat, min_lon, max_lon]):
+         if min_lat >= max_lat or min_lon >= max_lon:
+             raise HTTPException(status_code=400, detail="Invalid bounding box coordinates.")
+         logger.warning("Bounding box filtering requested but not currently implemented in db_client.query_recent_points. Returning all points within window/limit.")
+         # TODO: Implement bbox filtering in db_client.query_recent_points
+
+    # Call the database query function
+    readings = db_client.query_recent_points(limit=limit, window=window)
+
+    if readings is None: # db_client functions return list or None/empty list
+         logger.error("API: db_client.query_recent_points returned None.")
          return [] # Return empty list if query fails or no data
     return readings
 
 # --- Endpoint for Anomalies ---
+# This replaces the dummy list_anomalies
 @app.get(f"{API_PREFIX}/anomalies", response_model=List[Anomaly])
 async def list_anomalies(
-    start_time: Optional[datetime] = Query(None, description="Start time (ISO 8601 format)"),
-    end_time: Optional[datetime] = Query(None, description="End time (ISO 8601 format)")
+    start_time: Optional[datetime] = Query(None, description="Start time (ISO 8601 format) for filtering anomalies"),
+    end_time: Optional[datetime] = Query(None, description="End time (ISO 8601 format) for filtering anomalies")
 ):
     """
     List detected anomalies stored in InfluxDB within a given time range.
     Defaults to the last 24 hours if no range is provided.
-    NOTE: Requires a separate process to detect and write anomalies.
+    NOTE: Anomalies must be detected (by worker) and written to InfluxDB.
     """
-    logger.info(f"Request received for anomalies: start={start_time}, end={end_time}")
-    anomalies = query_anomalies_from_db(start_time=start_time, end_time=end_time)
-    if anomalies is None: # query_anomalies_from_db now returns list or empty list
-        return []
+    logger.info(f"API: Request received for anomalies: start={start_time}, end={end_time}")
+    # Call the database query function
+    anomalies = db_client.query_anomalies_from_db(start_time=start_time, end_time=end_time)
+
+    if anomalies is None: # db_client functions return list or None/empty list
+        logger.error("API: db_client.query_anomalies_from_db returned None.")
+        return [] # Return empty list if query fails or no data
+
+    logger.info(f"API: Returning {len(anomalies)} anomalies.")
     return anomalies
 
 # --- Endpoint for Pollution Density ---
+# This replaces the dummy get_pollution_density_for_region and uses bbox parameters
 @app.get(f"{API_PREFIX}/pollution_density", response_model=Optional[PollutionDensity])
 async def get_pollution_density_for_bbox(
     min_lat: float = Query(..., description="Minimum latitude of the bounding box"),
@@ -124,133 +178,29 @@ async def get_pollution_density_for_bbox(
     window: str = Query("24h", description="Time window for averaging (e.g., '1h', '24h')")
 ):
     """
-    Get the aggregated pollution density (average values) for a specified geographic bounding box from InfluxDB.
+    Get the aggregated pollution density (average values and data point count)
+    for a specified geographic bounding box from InfluxDB.
+    Returns null if no data is found in the region and time window.
     """
-    logger.info(f"Request received for density: bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}], window={window}")
+    logger.info(f"API: Request received for density: bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}], window={window}")
     # Basic validation for bounding box
     if min_lat >= max_lat or min_lon >= max_lon:
-        raise HTTPException(status_code=400, detail="Invalid bounding box coordinates.")
+        raise HTTPException(status_code=400, detail="Invalid bounding box coordinates: min must be less than max.")
+    if not (-90 <= min_lat <= 90) or not (-90 <= max_lat <= 90) or not (-180 <= min_lon <= 180) or not (-180 <= max_lon <= 180):
+         raise HTTPException(status_code=400, detail="Invalid bounding box coordinates: lat/lon out of range.")
 
-    density_data = query_density_in_bbox(
+
+    # Call the database query function
+    density_data = db_client.query_density_in_bbox(
         min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon, window=window
     )
 
-    if not density_data:
-        # Return 404 if no data found in the area/timeframe
-        # raise HTTPException(status_code=404, detail="No data found for the specified region and time window.")
-        # Or return null as per Optional[PollutionDensity]
+    if density_data is None:
+        logger.info(f"API: No density data found for bbox [{min_lat:.2f},{min_lon:.2f} - {max_lat:.2f},{max_lon:.2f}] in window {window}.")
+        # Return None as per Optional[PollutionDensity] response model
         return None
 
+    logger.debug(f"API: Returning density data: {density_data.region_name}")
     return density_data
 
-@app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
-async def ingest_air_quality_data(
-    ingest_data: IngestRequest = Body(...)
-):
-    """
-    Receives data, validates, and publishes ASYNCHRONOUSLY to the queue via connection pool.
-    """
-    logger.info(f"API: Async Pool Received ingest request: {ingest_data.model_dump()}")
-
-    # Call the publish function which now uses the pool
-    success = await queue_client.publish_message_async(ingest_data.model_dump())
-
-    if success:
-        # Log less verbosely on success perhaps
-        # logger.info(f"API: Async Pool published data for {ingest_data.latitude}, {ingest_data.longitude}")
-        return {"message": "Data point accepted for processing"}
-    else:
-        logger.error(f"API: Async Pool FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to queue data for processing after retries. Service may be temporarily unavailable."
-        )
-
-    
-# --- Update Endpoint ---
-@app.get(f"{API_PREFIX}/air_quality/location", response_model=Optional[AirQualityReading]) # Response can be None now
-async def get_air_quality_for_location(
-    lat: float = Query(..., ge=-90, le=90, description="Latitude of the location"),
-    lon: float = Query(..., ge=-180, le=180, description="Longitude of the location")
-):
-    """
-    Get the latest air quality data for a specific location from InfluxDB.
-    Searches within the last hour by default.
-    """
-    logger.info(f"Request received for lat={lat}, lon={lon}")
-    # Call the database query function
-    data = query_latest_location_data(lat=lat, lon=lon, window="1h")
-
-    if not data:
-        # Option 1: Return 404 Not Found
-        # raise HTTPException(status_code=404, detail="No recent data found for this location")
-        # Option 2: Return null/None (as allowed by Optional[AirQualityReading])
-         logger.warning(f"No data found for {lat},{lon}. Returning null.")
-         return None
-
-
-    # Convert the dictionary result back to Pydantic model if needed
-    # Ensure the keys match the model fields exactly
-    try:
-        # Map InfluxDB fields back to Pydantic model fields carefully
-        reading = AirQualityReading(
-            latitude=data.get('latitude', lat), # Ensure correct type
-            longitude=data.get('longitude', lon),
-            timestamp=data.get('timestamp'), # Ensure correct type
-            pm25=data.get('pm25'),
-            pm10=data.get('pm10'),
-            no2=data.get('no2'),
-            so2=data.get('so2'),
-            o3=data.get('o3')
-        )
-        return reading
-    except Exception as e:
-         logger.error(f"Error converting query result to Pydantic model: {e}", exc_info=True)
-         raise HTTPException(status_code=500, detail="Internal server error processing data")
-
-
-# --- TODO ---
-# - Create POST /ingest endpoint that uses db_client.write_air_quality_data
-# - Update other GET endpoints (points, anomalies, density) to use db_client query functions
-# - Implement the worker/consumer logic if using a queue
-# - Add Dockerfile for the backend service
-# - Uncomment and configure backend service in docker-compose.yml
-
-@app.get(f"{API_PREFIX}/air_quality/points", response_model=List[AirQualityReading])
-async def get_multiple_air_quality_points(
-    limit: int = Query(20, gt=0, le=100, description="Number of data points to return")
-):
-    """
-    Get a list of recent (dummy) air quality readings from various locations.
-    Used to populate the map initially.
-    """
-    readings = create_multiple_dummy_readings(count=limit)
-    return readings
-
-
-@app.get(f"{API_PREFIX}/anomalies", response_model=List[Anomaly])
-async def list_anomalies(
-    start_time: Optional[datetime] = Query(None, description="Start time for filtering anomalies (ISO 8601 format)"),
-    end_time: Optional[datetime] = Query(None, description="End time for filtering anomalies (ISO 8601 format)")
-):
-    """
-    List detected (dummy) anomalies within a given time range.
-    Defaults to the last 24 hours if no range is provided.
-    """
-    anomalies = create_dummy_anomalies(start_time, end_time)
-    return anomalies
-
-@app.get(f"{API_PREFIX}/pollution_density", response_model=PollutionDensity)
-async def get_pollution_density_for_region(
-    region: str = Query(..., description="Identifier for the geographic region (e.g., city name, bounding box)")
-):
-    """
-    Get the aggregated (dummy) pollution density for a specified region.
-    """
-    # In a real implementation, 'region' might be parsed to define coordinates
-    # or match a predefined area name in the database.
-    if not region:
-         raise HTTPException(status_code=400, detail="Region parameter is required")
-    density_data = create_dummy_pollution_density(region)
-    return density_data
-
+# --- End of API Endpoints ---
