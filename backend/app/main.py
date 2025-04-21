@@ -137,28 +137,6 @@ async def get_pollution_density_for_bbox(
 
     return density_data
 
-@app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
-async def ingest_air_quality_data(
-    ingest_data: IngestRequest = Body(...)
-):
-    """
-    Receives data, validates, and publishes ASYNCHRONOUSLY to the queue via connection pool.
-    """
-    logger.info(f"API: Async Pool Received ingest request: {ingest_data.model_dump()}")
-
-    # Call the publish function which now uses the pool
-    success = await queue_client.publish_message_async(ingest_data.model_dump())
-
-    if success:
-        # Log less verbosely on success perhaps
-        # logger.info(f"API: Async Pool published data for {ingest_data.latitude}, {ingest_data.longitude}")
-        return {"message": "Data point accepted for processing"}
-    else:
-        logger.error(f"API: Async Pool FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to queue data for processing after retries. Service may be temporarily unavailable."
-        )
 
     
 # --- Update Endpoint ---
@@ -203,9 +181,25 @@ async def get_air_quality_for_location(
          raise HTTPException(status_code=500, detail="Internal server error processing data")
 
 
-# --- TODO ---
-# - Create POST /ingest endpoint that uses db_client.write_air_quality_data
-# - Update other GET endpoints (points, anomalies, density) to use db_client query functions
-# - Implement the worker/consumer logic if using a queue
-# - Add Dockerfile for the backend service
-# - Uncomment and configure backend service in docker-compose.yml
+@app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_air_quality_data(
+    ingest_data: IngestRequest = Body(...)
+):
+    """
+    Receives data, validates, and publishes ASYNCHRONOUSLY to the queue via connection pool.
+    """
+    logger.info(f"API: Async Pool Received ingest request: {ingest_data.model_dump()}")
+
+    # Call the publish function which now uses the pool
+    success = await queue_client.publish_message_async(ingest_data.model_dump())
+
+    if success:
+        # Log less verbosely on success perhaps
+        # logger.info(f"API: Async Pool published data for {ingest_data.latitude}, {ingest_data.longitude}")
+        return {"message": "Data point accepted for processing"}
+    else:
+        logger.error(f"API: Async Pool FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to queue data for processing after retries. Service may be temporarily unavailable."
+        )
