@@ -1,13 +1,15 @@
 # backend/app/db_client.py
+import geohash # Import the library
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.exceptions import InfluxDBError
 from .config import get_settings
-from .models import AirQualityReading # Import your Pydantic model
+from .models import AirQualityReading
 from typing import List, Optional
 import logging
-from datetime import datetime,timedelta, timezone
-from .models import Anomaly 
+from datetime import datetime, timedelta, timezone
+from .models import Anomaly, PollutionDensity
+import json # Needed for query formatting later
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -238,110 +240,123 @@ def query_density_in_bbox(
     min_lat: float, max_lat: float, min_lon: float, max_lon: float, window: str = "24h"
 ) -> Optional[PollutionDensity]:
     """
-    Calculates average pollution density within a bounding box and time window.
+    Calculates average pollution density within a bounding box and time window,
+    using geohash filtering if available and enabled.
     """
     if not query_api:
         logger.error("InfluxDB query_api not available.")
         return None
 
-    # Construct filters for latitude and longitude using string tags
-    # Note: This requires lat/lon to be stored as string tags.
-    # For numerical range filtering, InfluxDB Cloud or specific setups are needed.
-    # Alternative: Query broader range and filter in Python (less efficient).
-    # Let's assume string tags for now for broader compatibility.
-    # A better approach would be geohashing if performance becomes an issue.
+    # --- USE GEOHASHING ---
+    use_geohash = True # Enable geohash filtering
+    location_filter = ""
 
-    # Query to calculate mean values and count within the bbox and window
+    if use_geohash:
+        # Calculate geohashes covering the bbox using the *same precision* as stored
+        bbox_geohashes = calculate_geohashes_for_bbox(
+            min_lat, max_lat, min_lon, max_lon,
+            precision=settings.geohash_precision_storage
+        )
+
+        if bbox_geohashes:
+            # Format the list for the Flux 'contains' function set parameter
+            # Use json.dumps for safe formatting of the list into a string
+            flux_geohash_set = json.dumps(bbox_geohashes)
+            # Filter points where the 'geohash' tag is one of the calculated prefixes
+            location_filter = f'|> filter(fn: (r) => contains(value: r.geohash, set: {flux_geohash_set}))'
+            logger.debug(f"Using geohash filter with {len(bbox_geohashes)} prefixes.")
+        else:
+            logger.warning("Could not calculate geohashes for bbox, falling back to coordinate filtering.")
+            use_geohash = False # Fallback if calculation failed
+
+    if not use_geohash:
+        # Fallback to numerical filtering (less efficient for large datasets)
+        # Ensure tags are treated as floats for comparison
+        location_filter = f'''
+          |> filter(fn: (r) => exists r.latitude and exists r.longitude)
+          |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
+          |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
+        '''
+        logger.debug("Using float coordinate filtering.")
+
+    # Single optimized query that gets both means and count in one pass
     flux_query = f'''
-      all_data = from(bucket: "{influx_bucket}")
-        |> range(start: -{window})
-        |> filter(fn: (r) => r["_measurement"] == "air_quality")
-        // Attempt numerical filtering (might only work on InfluxDB Cloud or specific versions)
-        |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
-        |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
-        // Consider adding filter(fn: (r) => r._value != nil) if needed
+    import "json" // Not strictly needed here unless converting results, but good practice
 
-      // Calculate means
-      means = all_data
-        |> keep(columns: ["_field", "_value"]) // Keep only fields needed for mean
-        |> group(columns: ["_field"])
-        |> mean()
-        |> group() // Ungroup
-        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+    // Define the base dataset
+    base_data = from(bucket: "{influx_bucket}")
+      |> range(start: -{window})
+      |> filter(fn: (r) => r["_measurement"] == "air_quality")
+      // Apply the chosen location filter (geohash or coordinate)
+      {location_filter}
+      // Filter by desired fields AFTER location filter for efficiency
+      |> filter(fn: (r) => r["_field"] == "pm25" or r["_field"] == "pm10" or r["_field"] == "no2" or r["_field"] == "so2" or r["_field"] == "o3")
 
-      // Calculate count
-      count_val = all_data
-        |> count() // Count records per field
-        |> first() // Take one count value (assuming all fields have same count)
-        |> findColumn(fn: (key) => true, column: "_value") // Extract the count value
 
-      // Combine results (using join or map - map might be simpler here if structure is known)
-      // Fetching separately and combining in Python might be easier than complex Flux join/union
-      means // Return the table with means
+    // Calculate counts per field
+    counts = base_data
+      |> group(columns: ["_field"]) // Group only by field to get total count per field
+      |> count(column: "_value")
+      |> group() // Ungroup before yield
+      |> yield(name: "counts")
+
+    // Calculate means in one pass
+    means = base_data
+      |> group(columns: ["_field"]) // Group only by field to get overall mean per field
+      |> mean(column: "_value")
+      |> group() // Ungroup before yield
+      |> yield(name: "means")
     '''
 
-    # --- Alternative approach: Fetch separately and combine in Python ---
-    flux_query_mean = f'''
-        from(bucket: "{influx_bucket}")
-          |> range(start: -{window})
-          |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          // Assuming tags are strings - this is less efficient but more compatible
-          |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
-          |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
-          |> filter(fn: (r) => r["_field"] == "pm25" or r["_field"] == "pm10" or r["_field"] == "no2" or r["_field"] == "so2" or r["_field"] == "o3")
-          |> mean() // Calculate mean per field
-          |> group(columns: ["_field"]) // Group by field to get one row per field mean
-          |> first() // Get the single mean value row for each field
-          |> group() // Ungroup
-          |> pivot(rowKey:["_measurement"], columnKey: ["_field"], valueColumn: "_value") // Pivot to get fields as columns
-    '''
-    flux_query_count = f'''
-        from(bucket: "{influx_bucket}")
-          |> range(start: -{window})
-          |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          // Same location filter
-          |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
-          |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
-          |> filter(fn: (r) => r["_field"] == "pm25") // Count based on one representative field
-          |> count()
-          |> keep(columns: ["_value"]) // Keep only the count value
-    '''
-
-    logger.debug(f"Executing Flux query for density means:\n{flux_query_mean}")
-    logger.debug(f"Executing Flux query for density count:\n{flux_query_count}")
+    logger.debug(f"Executing Flux query for density:\n{flux_query}")
 
     try:
-        # Execute mean query
-        mean_tables = query_api.query(query=flux_query_mean, org=influx_org)
-        mean_data = {}
-        if mean_tables and mean_tables[0].records:
-            mean_data = mean_tables[0].records[0].values
-            logger.debug(f"Mean query result: {mean_data}")
-        else:
-             logger.info(f"No data found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for mean calculation.")
-             # Return None or default density object? Returning None for now.
-             return None
+        results = query_api.query(query=flux_query, org=influx_org) # Changed variable name
 
-        # Execute count query
-        count_tables = query_api.query(query=flux_query_count, org=influx_org)
+        mean_data = {}
         data_points_count = 0
-        if count_tables and count_tables[0].records:
-            data_points_count = count_tables[0].records[0].get_value()
-            logger.debug(f"Count query result: {data_points_count}")
+        count_values = []
+
+        # Extract data from tables
+        for table in results: # Iterate through the yielded tables
+            if table.name == "means" and table.records:
+                 logger.debug(f"Processing 'means' table with {len(table.records)} records.")
+                 for record in table.records:
+                    field_name = record.values.get('_field') # Mean results are grouped by field
+                    field_value = record.get_value()
+                    if field_name:
+                        mean_data[field_name] = field_value
+            elif table.name == "counts" and table.records:
+                 logger.debug(f"Processing 'counts' table with {len(table.records)} records.")
+                 for record in table.records:
+                     # Store counts for each field to potentially check consistency
+                     count_values.append(record.get_value())
+
+
+        if not mean_data:
+            logger.info(f"No data found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for window {window}")
+            return None
+
+        # Use the first count value, assuming counts are consistent across fields after filtering
+        if count_values:
+            data_points_count = count_values[0]
+            if not all(c == data_points_count for c in count_values):
+                 logger.warning(f"Inconsistent counts across fields: {count_values}. Using first value: {data_points_count}")
         else:
-            # Should generally not happen if mean query returned data, but handle defensively
-            logger.warning(f"Count query returned no results, although mean query did.")
+             logger.warning("Could not retrieve data point counts.")
 
 
         # Construct the result object
         density = PollutionDensity(
-            region_name=f"BBox:[{min_lat:.2f},{min_lon:.2f} to {max_lat:.2f},{max_lon:.2f}]", # Describe the region
-            average_pm25=mean_data.get('pm25'), # Will be None if field wasn't present
+            region_name=f"BBox:[{min_lat:.3f},{min_lon:.3f} to {max_lat:.3f},{max_lon:.3f}]", # Increased precision
+            average_pm25=mean_data.get('pm25'),
             average_pm10=mean_data.get('pm10'),
-            # Add other averages as needed from mean_data
+            average_no2=mean_data.get('no2'),
+            average_so2=mean_data.get('so2'),
+            average_o3=mean_data.get('o3'),
             data_points_count=data_points_count
         )
-        logger.info(f"Calculated density: {density}")
+        logger.info(f"Calculated density: PM2.5={density.average_pm25 or 'N/A'}, Count={density.data_points_count}")
         return density
 
     except InfluxDBError as e:
@@ -351,62 +366,110 @@ def query_density_in_bbox(
         logger.error(f"Generic error querying density: {e}", exc_info=True)
         return None
 
+def calculate_geohashes_for_bbox(min_lat, max_lat, min_lon, max_lon, precision): # Use the precision argument
+    """
+    Calculate a list of geohash prefixes covering the bounding box.
+    (Simple sampling approach)
+    """
+    # Check if library is available first
+    try:
+        import geohash
+    except ImportError:
+        logger.warning("Geohash library not available for bbox calculation. Install with: pip install python-geohash")
+        return []
+
+    # This is a simplified approach - might include slightly more hashes than strictly needed
+    # Consider a more precise algorithm like 'geohash_bbox' from external libs if needed
+    lat_step = (max_lat - min_lat) / 10
+    lon_step = (max_lon - min_lon) / 10
+
+    geohashes = set()
+
+    # Sample points including corners and center
+    sample_lats = [min_lat] + [min_lat + i * lat_step for i in range(1, 10)] + [max_lat]
+    sample_lons = [min_lon] + [min_lon + i * lon_step for i in range(1, 10)] + [max_lon]
+
+    for lat in sample_lats:
+        for lon in sample_lons:
+            # Ensure the sample point is strictly within the bbox for encoding
+            if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                try:
+                    h = geohash.encode(lat, lon, precision=precision)
+                    geohashes.add(h[:precision]) # Ensure we only add the prefix of desired length
+                except Exception as e:
+                     logger.warning(f"Error encoding geohash for sample point {lat},{lon}: {e}")
+
+    # Add geohashes of the corners explicitly
+    corners = [(min_lat, min_lon), (min_lat, max_lon), (max_lat, min_lon), (max_lat, max_lon)]
+    for lat, lon in corners:
+         try:
+             h = geohash.encode(lat, lon, precision=precision)
+             geohashes.add(h[:precision])
+         except Exception as e:
+             logger.warning(f"Error encoding geohash for corner point {lat},{lon}: {e}")
+
+
+    logger.debug(f"Calculated {len(geohashes)} geohash prefixes for bbox with precision {precision}")
+    return list(geohashes)
 
 def write_air_quality_data(reading: AirQualityReading):
-    """Writes a single AirQualityReading to InfluxDB."""
+    """Writes a single AirQualityReading to InfluxDB, including a geohash tag."""
     if not write_api:
         logger.error("InfluxDB write_api not available.")
-        return False # Indicate failure
+        return False
 
-    # Ensure the timestamp from the reading is timezone-aware (it should be from main.py)
     if reading.timestamp.tzinfo is None:
         logger.warning(f"Timestamp for {reading.latitude},{reading.longitude} was naive. Assuming UTC.")
         timestamp_to_write = reading.timestamp.replace(tzinfo=timezone.utc)
     else:
         timestamp_to_write = reading.timestamp
 
-    point = (
-        Point("air_quality") # Measurement name
-        .tag("latitude", str(reading.latitude)) # Tags are indexed
-        .tag("longitude", str(reading.longitude))
-        .field("pm25", reading.pm25) # Fields are data values
-        .field("pm10", reading.pm10)
-        .field("no2", reading.no2)
-        .field("so2", reading.so2)
-        .field("o3", reading.o3)
-        # --- CHANGE HERE ---
-        # Pass the datetime object directly. Specify precision.
-        .time(timestamp_to_write, WritePrecision.MS)
-        # --- END CHANGE ---
-    )
+    # --- START GEOHASH CALCULATION ---
+    calculated_geohash = None
+    if reading.latitude is not None and reading.longitude is not None:
+        try:
+            calculated_geohash = geohash.encode(
+                reading.latitude,
+                reading.longitude,
+                precision=settings.geohash_precision_storage
+            )
+        except Exception as e:
+            logger.error(f"Could not calculate geohash for {reading.latitude},{reading.longitude}: {e}")
+            # Decide if you want to fail the write or just proceed without the tag
+            # Proceeding without the tag for robustness:
+            calculated_geohash = None
+    # --- END GEOHASH CALCULATION ---
 
-    # Filter out None fields before writing, as InfluxDB doesn't store null fields natively
-    # Rebuild the point adding only non-None fields (tags and time are already set)
-    # This prevents errors if some optional fields are None
-    filtered_point = Point("air_quality") \
+    # Create the base point structure
+    point = Point("air_quality") \
         .tag("latitude", str(reading.latitude)) \
         .tag("longitude", str(reading.longitude)) \
         .time(timestamp_to_write, WritePrecision.MS)
 
+    # Add the geohash tag IF it was calculated successfully
+    if calculated_geohash:
+        point.tag("geohash", calculated_geohash) # Add the geohash tag
+
+    # Add non-null fields (as before)
     non_null_fields = {k: v for k, v in reading.model_dump().items() if k not in ['latitude', 'longitude', 'timestamp'] and v is not None}
     if not non_null_fields:
         logger.warning(f"Skipping write for {reading.latitude},{reading.longitude} as no non-null fields were provided.")
-        return True # Technically not a write failure, just nothing to write
+        return True # Nothing to write
 
     for key, value in non_null_fields.items():
-        filtered_point.field(key, value)
+        point.field(key, value) # Add fields to the point object
 
-
+    # Write the point (which now includes fields and potentially the geohash tag)
     try:
-        # Write the filtered point
-        write_api.write(bucket=influx_bucket, org=influx_org, record=filtered_point)
-        logger.debug(f"Successfully wrote point: {filtered_point.to_line_protocol()}")
+        write_api.write(bucket=influx_bucket, org=influx_org, record=point)
+        log_msg = f"Successfully wrote point for {reading.latitude},{reading.longitude}"
+        if calculated_geohash:
+            log_msg += f" (geohash: {calculated_geohash})"
+        logger.debug(log_msg + f" Line Protocol: {point.to_line_protocol()}")
         return True
     except InfluxDBError as e:
         logger.error(f"InfluxDB Error writing data: {e}", exc_info=True)
-        if hasattr(e, 'response'):
-             logger.error(f"InfluxDB Response Headers: {e.response.headers}")
-             logger.error(f"InfluxDB Response Body: {e.response.data}")
+        # ... (rest of error handling) ...
         return False
     except Exception as e:
         logger.error(f"Generic error writing data: {e}", exc_info=True)

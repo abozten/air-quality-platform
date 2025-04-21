@@ -13,6 +13,8 @@ from .db_client import (
 )
 from . import db_client
 from . import queue_client
+from .models import AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint
+from .aggregation import aggregate_by_geohash
 
 
 
@@ -77,19 +79,21 @@ from .db_client import (
 )
 
 # --- Endpoint for Multiple Points ---
-@app.get(f"{API_PREFIX}/air_quality/points", response_model=List[AirQualityReading])
+@app.get(f"{API_PREFIX}/air_quality/points", response_model=List[AggregatedAirQualityPoint])
 async def get_multiple_air_quality_points(
-    limit: int = Query(50, gt=0, le=200, description="Max number of distinct location points to return"),
-    window: str = Query("1h", description="Time window to look for latest data (e.g., '1h', '24h', '5m')")
+    limit: int = Query(50, gt=0, le=200, description="Max number of geohash grid cells to return"),
+    window: str = Query("1h", description="Time window to look for latest data (e.g., '1h', '24h', '5m')"),
+    geohash_precision: int = Query(6, ge=1, le=12, description="Geohash precision for spatial aggregation")
 ):
     """
-    Get a list of recent air quality readings from distinct locations stored in InfluxDB.
+    Get a list of recent air quality readings aggregated by geohash grid cells.
     """
-    logger.info(f"Request received for recent points: limit={limit}, window={window}")
-    readings = query_recent_points(limit=limit, window=window)
-    if readings is None: # query_recent_points now returns list or empty list
-         return [] # Return empty list if query fails or no data
-    return readings
+    logger.info(f"Request received for recent points: limit={limit}, window={window}, geohash_precision={geohash_precision}")
+    readings = query_recent_points(limit=limit * 2, window=window)  # Fetch more to allow for aggregation
+    if not readings:
+        return []
+    aggregated = aggregate_by_geohash(readings, precision=geohash_precision, max_cells=limit)
+    return aggregated
 
 # --- Endpoint for Anomalies ---
 @app.get(f"{API_PREFIX}/anomalies", response_model=List[Anomaly])
@@ -139,7 +143,6 @@ async def get_pollution_density_for_bbox(
 
 
     
-# --- Update Endpoint ---
 @app.get(f"{API_PREFIX}/air_quality/location", response_model=Optional[AirQualityReading]) # Response can be None now
 async def get_air_quality_for_location(
     lat: float = Query(..., ge=-90, le=90, description="Latitude of the location"),
@@ -180,7 +183,7 @@ async def get_air_quality_for_location(
          logger.error(f"Error converting query result to Pydantic model: {e}", exc_info=True)
          raise HTTPException(status_code=500, detail="Internal server error processing data")
 
-
+#POST endpoint for ingesting air quality data
 @app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_air_quality_data(
     ingest_data: IngestRequest = Body(...)

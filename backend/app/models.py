@@ -40,6 +40,18 @@ class PollutionDensity(BaseModel):
     # Add other averages as needed
     data_points_count: int = Field(..., example=150)
 
+
+class AggregatedAirQualityPoint(BaseModel):
+    geohash: str = Field(..., example="u10hfg")
+    latitude: float = Field(..., example=51.501)
+    longitude: float = Field(..., example=-0.123)
+    avg_pm25: Optional[float] = Field(None, example=15.2)
+    avg_pm10: Optional[float] = Field(None, example=28.9)
+    avg_no2: Optional[float] = Field(None, example=35.1)
+    avg_so2: Optional[float] = Field(None, example=4.8)
+    avg_o3: Optional[float] = Field(None, example=55.3)
+    count: int = Field(..., example=10, description="Number of raw points aggregated in this cell")
+
 # For request query parameters if needed later
 # class TimeRangeQuery(BaseModel):
 #     start_time: Optional[datetime] = None
