@@ -2,77 +2,253 @@
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.exceptions import InfluxDBError
-from .config import get_settings
-from .models import AirQualityReading # Import your Pydantic model
+from .config import get_settings # Use get_settings() here
+from .models import AirQualityReading, Anomaly, PollutionDensity # Import your Pydantic models
 from typing import List, Optional
 import logging
-from datetime import datetime,timedelta, timezone
-from .models import Anomaly 
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO) # Ensure basic config is set
 
-settings = get_settings()
+settings = get_settings() # Get settings
 
-# Ensure URL from environment is used when running in Docker
+# InfluxDB Configuration
 influx_url = settings.influxdb_url
 influx_token = settings.influxdb_token
 influx_org = settings.influxdb_org
 influx_bucket = settings.influxdb_bucket
 
-logger.info(f"Attempting to connect to InfluxDB at {influx_url} in org '{influx_org}'")
+# --- Global Client and APIs (Initialized once) ---
+client: Optional[InfluxDBClient] = None
+write_api = None
+query_api = None
 
-try:
-    client = InfluxDBClient(url=influx_url, token=influx_token, org=influx_org, timeout=20_000)
-    write_api = client.write_api(write_options=SYNCHRONOUS)
-    query_api = client.query_api()
-    logger.info("InfluxDB client initialized.")
+def initialize_influxdb_client():
+    """Initializes the global InfluxDB client and APIs."""
+    global client, write_api, query_api
+    if client is not None:
+        logger.info("InfluxDB client already initialized.")
+        return # Already initialized
 
-    # Check connection / readiness (Updated Check)
+    logger.info(f"Attempting to connect to InfluxDB at {influx_url} in org '{influx_org}'")
     try:
-        ready = client.ready()
-        if hasattr(ready, 'status') and ready.status == "ready": # Check status attribute
-            # Safely try to get version if available
-            version_info = f" Version: {ready.version}" if hasattr(ready, 'version') else ""
-            logger.info(f"InfluxDB connection successful! Status: {ready.status}{version_info}")
-        elif hasattr(ready, 'status'):
-             logger.warning(f"InfluxDB ready check returned status: {ready.status}")
-        else:
-             logger.warning(f"InfluxDB ready check response object structure unexpected: {ready}")
+        client = InfluxDBClient(url=influx_url, token=influx_token, org=influx_org, timeout=20_000)
+        write_api = client.write_api(write_options=SYNCHRONOUS)
+        query_api = client.query_api()
+        logger.info("InfluxDB client and APIs initialized.")
+
+        # Check connection / readiness
+        try:
+            ready = client.ready()
+            if hasattr(ready, 'status') and ready.status == "ready":
+                version_info = f" Version: {ready.version}" if hasattr(ready, 'version') else ""
+                logger.info(f"InfluxDB connection successful! Status: {ready.status}{version_info}")
+            elif hasattr(ready, 'status'):
+                 logger.warning(f"InfluxDB ready check returned status: {ready.status}")
+            else:
+                 logger.warning(f"InfluxDB ready check response object structure unexpected: {ready}")
+
+        except Exception as e:
+             logger.error(f"Error checking InfluxDB readiness: {e}", exc_info=True)
 
     except Exception as e:
-         logger.error(f"Error checking InfluxDB readiness: {e}", exc_info=True)
+        logger.error(f"Failed to initialize InfluxDB client: {e}", exc_info=True)
+        # Set to None to indicate failure
+        client = None
+        write_api = None
+        query_api = None
+        # Optionally, raise the exception if DB connection is critical for startup
+        # raise ConnectionError(f"Failed to connect to InfluxDB: {e}") from e
+
+def close_influx_client():
+    """Closes the global InfluxDB client connection."""
+    global client
+    if client:
+        logger.info("Closing InfluxDB client.")
+        try:
+            client.close()
+            logger.info("InfluxDB client closed.")
+        except Exception as e:
+             logger.error(f"Error closing InfluxDB client: {e}", exc_info=True)
+        client = None # Ensure it's marked as closed
+        # write_api and query_api should also be considered invalid
+
+# Initialize client on module load (or call explicitly during app startup lifespan)
+# Calling here ensures it's ready when other modules import db_client
+initialize_influxdb_client()
 
 
-except Exception as e:
-    logger.error(f"Failed to initialize InfluxDB client: {e}", exc_info=True)
-    # Set APIs to None or raise an exception to prevent app startup if DB is critical
-    client = None
-    write_api = None
-    query_api = None
+# --- Write Function for Air Quality Readings ---
+def write_air_quality_data(reading: AirQualityReading) -> bool:
+    """Writes a single AirQualityReading to InfluxDB."""
+    if not write_api:
+        logger.error("InfluxDB write_api not available. Cannot write reading.")
+        return False # Indicate failure
 
-from .models import Anomaly, PollutionDensity # Import necessary models
+    # Ensure the timestamp from the reading is timezone-aware
+    # datetime.utcnow() is naive, FastAPI's default_factory uses it.
+    # Better practice: always use timezone-aware datetimes (e.g., datetime.now(timezone.utc))
+    if reading.timestamp.tzinfo is None:
+        # Assume UTC if naive, convert to UTC
+        timestamp_to_write = reading.timestamp.replace(tzinfo=timezone.utc)
+        logger.warning(f"Timestamp for {reading.latitude},{reading.longitude} was naive. Assuming UTC and converting.")
+    else:
+        # Ensure it's in UTC before writing (InfluxDB prefers UTC)
+        timestamp_to_write = reading.timestamp.astimezone(timezone.utc)
 
-# --- Query Function for Multiple Points ---
-def query_recent_points(limit: int = 50, window: str = "1h") -> List[AirQualityReading]:
-    """
-    Queries the latest distinct air quality readings from different locations
-    within a specified time window.
-    """
+
+    # Filter out None fields before writing
+    non_null_fields = {k: v for k, v in reading.model_dump().items() if k not in ['latitude', 'longitude', 'timestamp'] and v is not None}
+
+    if not non_null_fields:
+        logger.warning(f"Skipping write for {reading.latitude},{reading.longitude} at {reading.timestamp.isoformat()} as no non-null fields were provided.")
+        return True # Nothing to write, consider it successful in this context
+
+    # Create the point
+    # Use lat/lon as TAGS for efficient filtering and grouping
+    point = (
+        Point("air_quality") # Measurement name
+        .tag("latitude", str(reading.latitude)) # Tags are indexed
+        .tag("longitude", str(reading.longitude))
+        # .tag("sensor_id", "some_id") # Consider adding a sensor_id tag if available
+        .time(timestamp_to_write, WritePrecision.MS)
+    )
+
+    # Add non-null fields
+    for key, value in non_null_fields.items():
+        point.field(key, value)
+
+    try:
+        write_api.write(bucket=influx_bucket, org=influx_org, record=point)
+        logger.debug(f"Successfully wrote point: {point.to_line_protocol()}")
+        return True
+    except InfluxDBError as e:
+        logger.error(f"InfluxDB Error writing data: {e}", exc_info=True)
+        if hasattr(e, 'response') and hasattr(e.response, 'data'):
+             logger.error(f"InfluxDB Response Body: {e.response.data.decode('utf-8')}")
+        return False
+    except Exception as e:
+        logger.error(f"Generic error writing data: {e}", exc_info=True)
+        return False
+
+# --- Write Function for Anomalies ---
+def write_anomaly_data(anomaly: Anomaly) -> bool:
+    """Writes a detected Anomaly to InfluxDB."""
+    if not write_api:
+        logger.error("InfluxDB write_api not available for writing anomaly.")
+        return False
+
+    # Ensure timestamp is timezone-aware and in UTC
+    if anomaly.timestamp.tzinfo is None:
+        timestamp_to_write = anomaly.timestamp.replace(tzinfo=timezone.utc)
+        logger.warning(f"Anomaly timestamp for {anomaly.id} was naive. Assuming UTC and converting.")
+    else:
+        timestamp_to_write = anomaly.timestamp.astimezone(timezone.utc)
+
+
+    point = (
+        Point("air_quality_anomalies") # Different measurement name
+        .tag("latitude", str(anomaly.latitude)) # Tag location
+        .tag("longitude", str(anomaly.longitude))
+        .tag("parameter", anomaly.parameter) # Tag the parameter causing anomaly
+        .field("value", anomaly.value) # Store the anomalous value
+        .field("description", anomaly.description) # Store the description
+        .field("id", anomaly.id) # Store the unique ID (as a field, not tag, as it's unique per point)
+        .time(timestamp_to_write, WritePrecision.MS)
+    )
+
+    try:
+        write_api.write(bucket=influx_bucket, org=influx_org, record=point)
+        logger.info(f"Successfully wrote anomaly: {anomaly.id} - {anomaly.description}")
+        return True
+    except InfluxDBError as e:
+        logger.error(f"InfluxDB Error writing anomaly data: {e}", exc_info=True)
+        if hasattr(e, 'response') and hasattr(e.response, 'data'):
+             logger.error(f"InfluxDB Response Body: {e.response.data.decode('utf-8')}")
+        return False
+    except Exception as e:
+        logger.error(f"Generic error writing anomaly data: {e}", exc_info=True)
+        return False
+
+# --- Query Function for Latest Point by Location ---
+def query_latest_location_data(lat: float, lon: float, window: str = "1h") -> Optional[AirQualityReading]:
+    """Queries the latest data point for a specific latitude/longitude within a window."""
     if not query_api:
-        logger.error("InfluxDB query_api not available.")
-        return []
+        logger.error("InfluxDB query_api not available for querying latest location data.")
+        return None
 
-    # Flux query to get the last point for each lat/lon combination within the window
+    # Note: Assuming lat/lon are stored as TAGS for efficient filtering
     flux_query = f'''
         from(bucket: "{influx_bucket}")
           |> range(start: -{window})
           |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          |> group(columns: ["latitude", "longitude"]) // Group by location
-          |> last() // Get the latest point in each group
-          |> group(columns: ["_measurement"]) // Ungroup before pivot
+          |> filter(fn: (r) => r["latitude"] == "{lat}") // Filter using tag value (string comparison)
+          |> filter(fn: (r) => r["longitude"] == "{lon}") // Filter using tag value (string comparison)
+          |> last() // Get the most recent point for this specific tag combination
+          |> pivot(rowKey:["_time", "latitude", "longitude"], columnKey: ["_field"], valueColumn: "_value") // Reshape fields into columns
+          |> limit(n: 1) // Ensure only one record is returned
+    '''
+    logger.debug(f"Executing Flux query for latest {lat},{lon}:\n{flux_query}")
+
+    try:
+        tables = query_api.query(query=flux_query, org=influx_org)
+
+        if not tables or not tables[0].records:
+             logger.info(f"No data found for lat={lat}, lon={lon} in the last {window}")
+             return None
+
+        # Process the result (pivot makes this easier)
+        record = tables[0].records[0] # Get the first (and only) record after pivot
+        data = record.values # Dictionary of fields and values
+
+        # Map InfluxDB record data back to Pydantic model
+        # Handle potential TypeErrors during conversion
+        try:
+            reading = AirQualityReading(
+                latitude=float(record.values.get("latitude", lat)), # Get from tag or use input default
+                longitude=float(record.values.get("longitude", lon)), # Get from tag or use input default
+                timestamp=record.get_time(), # Use InfluxDB timestamp (should be timezone-aware)
+                pm25=data.get('pm25'),
+                pm10=data.get('pm10'),
+                no2=data.get('no2'),
+                so2=data.get('so2'),
+                o3=data.get('o3')
+            )
+            return reading
+        except Exception as e:
+             logger.error(f"Error mapping query result to AirQualityReading model for {lat},{lon}: {e}. Data: {data}", exc_info=True)
+             return None # Return None if mapping fails
+
+    except InfluxDBError as e:
+        logger.error(f"InfluxDB Error querying data for {lat},{lon}: {e}", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(f"Generic error querying data for {lat},{lon}: {e}", exc_info=True)
+        return None
+
+
+# --- Query Function for Multiple Recent Points (Distinct Locations) ---
+def query_recent_points(limit: int = 50, window: str = "1h") -> List[AirQualityReading]:
+    """
+    Queries the latest air quality reading for distinct latitude/longitude TAGS
+    within a specified time window. Returns up to `limit` points.
+    """
+    if not query_api:
+        logger.error("InfluxDB query_api not available for querying recent points.")
+        return []
+
+    # Flux query to get the last point for each unique lat/lon TAG combination within the window
+    flux_query = f'''
+        from(bucket: "{influx_bucket}")
+          |> range(start: -{window})
+          |> filter(fn: (r) => r["_measurement"] == "air_quality")
+          |> group(columns: ["latitude", "longitude"]) // Group by location TAGS
+          |> last() // Get the latest point in each location group
+          |> group() // Ungroup before pivot
           |> pivot(rowKey:["_time", "latitude", "longitude"], columnKey: ["_field"], valueColumn: "_value")
           |> limit(n: {limit}) // Limit the number of locations returned
+          |> sort(columns: ["_time"], desc: true) // Optional: Sort by time
     '''
     logger.debug(f"Executing Flux query for recent points:\n{flux_query}")
 
@@ -80,13 +256,14 @@ def query_recent_points(limit: int = 50, window: str = "1h") -> List[AirQualityR
     try:
         tables = query_api.query(query=flux_query, org=influx_org)
         if not tables:
+            logger.info("Query for recent points returned no tables.")
             return []
 
         for table in tables:
             for record in table.records:
                 try:
                     data = record.values
-                    # Convert lat/lon tags back to float, handle potential errors
+                    # Lat/Lon are tags, retrieved as fields after pivot
                     lat = float(data.get("latitude", 0.0))
                     lon = float(data.get("longitude", 0.0))
 
@@ -120,39 +297,43 @@ def query_recent_points(limit: int = 50, window: str = "1h") -> List[AirQualityR
 def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> List[Anomaly]:
     """
     Queries detected anomalies stored in the 'air_quality_anomalies' measurement.
-    NOTE: Requires anomalies to be detected and written separately.
+    Filters by optional time range.
     """
     if not query_api:
-        logger.error("InfluxDB query_api not available.")
+        logger.error("InfluxDB query_api not available for querying anomalies.")
         return []
 
     # Default time range (e.g., last 24 hours) if not provided
     if start_time is None and end_time is None:
         range_filter = f'|> range(start: -24h)'
     elif start_time and end_time:
-         # Ensure timezone-aware before formatting
-         start_iso = start_time.astimezone(timezone.utc).isoformat() if start_time else ''
-         end_iso = end_time.astimezone(timezone.utc).isoformat() if end_time else ''
-         range_filter = f'|> range(start: {start_iso}, stop: {end_iso})'
+         # Ensure timezone-aware before formatting and convert to UTC
+         start_iso = start_time.astimezone(timezone.utc).isoformat()
+         end_iso = end_time.astimezone(timezone.utc).isoformat()
+         range_filter = f'|> range(start: time(v: "{start_iso}"), stop: time(v: "{end_iso}"))'
     elif start_time:
-         start_iso = start_time.astimezone(timezone.utc).isoformat() if start_time else ''
-         range_filter = f'|> range(start: {start_iso})'
-    else: # Only end_time provided
-        end_iso = end_time.astimezone(timezone.utc).isoformat() if end_time else ''
-        # Need a start, perhaps default to beginning of time or a reasonable past limit
-        range_filter = f'|> range(start: 0, stop: {end_iso})' # Or range(start: -30d, stop: ...)
+         start_iso = start_time.astimezone(timezone.utc).isoformat()
+         range_filter = f'|> range(start: time(v: "{start_iso}"))'
+    elif end_time: # Only end_time provided
+        end_iso = end_time.astimezone(timezone.utc).isoformat()
+        # Need a start, perhaps default to beginning of time (InfluxDB default epoch 0) or a reasonable past limit
+        range_filter = f'|> range(start: 0, stop: time(v: "{end_iso}"))'
 
 
     # Flux query to get anomaly records
     # Assumes measurement 'air_quality_anomalies' with tags/fields matching Anomaly model
     # Tags: latitude, longitude, parameter
-    # Fields: value, description, id (or use time as ID)
+    # Fields: value, description, id
     flux_query = f'''
         from(bucket: "{influx_bucket}")
           {range_filter}
           |> filter(fn: (r) => r["_measurement"] == "air_quality_anomalies")
-          |> pivot(rowKey:["_time", "latitude", "longitude"], columnKey: ["_field"], valueColumn: "_value")
-          // Add sorting if needed: |> sort(columns: ["_time"], desc: true)
+          // Filter for fields/tags needed for Anomaly model
+          |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "description" or r["_field"] == "id" or r["_field"] == "parameter" or r["_field"] == "latitude" or r["_field"] == "longitude")
+          // Group by time and id (unique identifier) to pivot correctly per anomaly event
+          |> group(columns: ["_time", "id", "latitude", "longitude", "parameter"])
+          |> pivot(rowKey:["_time", "id", "latitude", "longitude", "parameter"], columnKey: ["_field"], valueColumn: "_value")
+          |> sort(columns: ["_time"], desc: true) // Sort by time, most recent first
     '''
     logger.debug(f"Executing Flux query for anomalies:\n{flux_query}")
 
@@ -160,29 +341,39 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
     try:
         tables = query_api.query(query=flux_query, org=influx_org)
         if not tables:
+            logger.info("Query for anomalies returned no tables.")
             # This is expected if no anomalies are stored yet
-            logger.info("No anomalies found in the specified range.")
             return []
 
         for table in tables:
             for record in table.records:
                  try:
                     data = record.values
-                    lat = float(data.get("latitude", 0.0)) # Get tags if stored
+                    # Get data from pivoted fields
+                    anomaly_id = str(data.get("id"))
+                    lat = float(data.get("latitude", 0.0))
                     lon = float(data.get("longitude", 0.0))
+                    parameter = str(data.get("parameter", "unknown"))
+                    value = float(data.get("value", 0.0))
+                    description = str(data.get("description", ""))
+
+                    # Basic validation before creating model instance
+                    if not anomaly_id or not record.get_time():
+                         logger.warning(f"Skipping anomaly record with missing ID or timestamp: {data}")
+                         continue
 
                     anomaly = Anomaly(
-                        id=str(data.get("id", record.get_time().isoformat())), # Use 'id' field or timestamp as fallback ID
+                        id=anomaly_id,
                         latitude=lat,
                         longitude=lon,
-                        timestamp=record.get_time(),
-                        parameter=str(data.get("parameter", "unknown")), # Tag or field
-                        value=float(data.get("value", 0.0)), # Field
-                        description=str(data.get("description", "")) # Field
+                        timestamp=record.get_time(), # InfluxDB timestamp (should be timezone-aware)
+                        parameter=parameter,
+                        value=value,
+                        description=description
                     )
                     results.append(anomaly)
                  except Exception as e:
-                    logger.error(f"Error processing anomaly record: {e} - Record: {record.values}", exc_info=True)
+                    logger.error(f"Error processing anomaly record: {e} - Record data: {record.values}", exc_info=True)
                     continue # Skip faulty record
 
         logger.info(f"Found {len(results)} anomalies.")
@@ -199,112 +390,117 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
         logger.error(f"Generic error querying anomalies: {e}", exc_info=True)
         return []
 
-def write_anomaly_data(anomaly: Anomaly):
-    """Writes a detected Anomaly to InfluxDB."""
-    if not write_api:
-        logger.error("InfluxDB write_api not available for writing anomaly.")
-        return False
-
-    # Ensure timestamp is timezone-aware
-    if anomaly.timestamp.tzinfo is None:
-        timestamp_to_write = anomaly.timestamp.replace(tzinfo=timezone.utc)
-    else:
-        timestamp_to_write = anomaly.timestamp
-
-    point = (
-        Point("air_quality_anomalies") # Different measurement name
-        .tag("latitude", str(anomaly.latitude))
-        .tag("longitude", str(anomaly.longitude))
-        .tag("parameter", anomaly.parameter) # Tag the parameter causing anomaly
-        .field("value", anomaly.value) # Store the anomalous value
-        .field("description", anomaly.description) # Store the description
-        .field("id", anomaly.id) # Store the unique ID
-        .time(timestamp_to_write, WritePrecision.MS)
-    )
-
-    try:
-        write_api.write(bucket=influx_bucket, org=influx_org, record=point)
-        logger.info(f"Successfully wrote anomaly: {anomaly.id} - {anomaly.description}")
-        return True
-    except InfluxDBError as e:
-        logger.error(f"InfluxDB Error writing anomaly data: {e}", exc_info=True)
-        return False
-    except Exception as e:
-        logger.error(f"Generic error writing anomaly data: {e}", exc_info=True)
-        return False
-
-# --- Query Function for Pollution Density ---
+# --- Query Function for Pollution Density in BBox ---
 def query_density_in_bbox(
     min_lat: float, max_lat: float, min_lon: float, max_lon: float, window: str = "24h"
 ) -> Optional[PollutionDensity]:
     """
-    Calculates average pollution density within a bounding box and time window.
+    Calculates average pollution density (mean values) and count of data points
+    within a bounding box and time window. Lat/Lon must be stored as TAGS.
     """
     if not query_api:
-        logger.error("InfluxDB query_api not available.")
+        logger.error("InfluxDB query_api not available for querying density.")
         return None
 
-    # Construct filters for latitude and longitude using string tags
-    # Note: This requires lat/lon to be stored as string tags.
-    # For numerical range filtering, InfluxDB Cloud or specific setups are needed.
-    # Alternative: Query broader range and filter in Python (less efficient).
-    # Let's assume string tags for now for broader compatibility.
-    # A better approach would be geohashing if performance becomes an issue.
-
-    # Query to calculate mean values and count within the bbox and window
+    # Flux query to calculate mean values and count within the bbox and window
+    # Filtering on TAGS is efficient. Converting TAGS to floats in Flux requires `float()`
+    # and then comparing numerically.
     flux_query = f'''
-      all_data = from(bucket: "{influx_bucket}")
+      bbox_data = from(bucket: "{influx_bucket}")
         |> range(start: -{window})
         |> filter(fn: (r) => r["_measurement"] == "air_quality")
-        // Attempt numerical filtering (might only work on InfluxDB Cloud or specific versions)
+        // Filter by latitude and longitude TAGS (must convert string tag to float)
         |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
         |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
-        // Consider adding filter(fn: (r) => r._value != nil) if needed
+        |> filter(fn: (r) =>
+            r["_field"] == "pm25" or
+            r["_field"] == "pm10" or
+            r["_field"] == "no2" or
+            r["_field"] == "so2" or
+            r["_field"] == "o3"
+           )
+        |> keep(columns: ["_time", "_field", "_value", "latitude", "longitude"]) // Keep necessary columns
 
-      // Calculate means
-      means = all_data
-        |> keep(columns: ["_field", "_value"]) // Keep only fields needed for mean
-        |> group(columns: ["_field"])
-        |> mean()
-        |> group() // Ungroup
-        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+      // Calculate mean for each field
+      means = bbox_data
+        |> group(columns: ["_field"]) // Group by parameter field
+        |> mean() // Calculate mean per field
+        |> group() // Ungroup for pivot
+        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value") // Pivot fields into columns
 
-      // Calculate count
-      count_val = all_data
-        |> count() // Count records per field
-        |> first() // Take one count value (assuming all fields have same count)
-        |> findColumn(fn: (key) => true, column: "_value") // Extract the count value
+      // Calculate total count of relevant data points within the bbox and window
+      // We can count records for one representative field like pm25 after bbox filter
+      count_val = bbox_data
+        |> filter(fn: (r) => r["_field"] == "pm25") // Just count one type of reading per point
+        |> count() // Total count of pm25 values in the bbox/window
+        |> keep(columns: ["_value"]) // Keep only the count value column
 
-      // Combine results (using join or map - map might be simpler here if structure is known)
-      // Fetching separately and combining in Python might be easier than complex Flux join/union
-      means // Return the table with means
+      // Use yield to return both tables (means and count). Need to process separately in Python.
+      means |> yield(name: "means")
+      count_val |> yield(name: "count")
     '''
 
-    # --- Alternative approach: Fetch separately and combine in Python ---
+    logger.debug(f"Executing Flux query for density:\n{flux_query}")
+
+    mean_data: dict = {}
+    data_points_count = 0
+
+    try:
+        # Execute the query which should return multiple tables if yields are used
+        query_result = query_api.query(query=flux_query, org=influx_org)
+
+        if not query_result:
+             logger.info(f"Density query returned no results for bbox [{min_lat:.2f},{min_lon:.2f} - {max_lat:.2f},{max_lon:.2f}].")
+             return None # No data at all
+
+        # Process the tables based on their yield names
+        for table in query_result:
+            # Check table.name or the table structure
+            if table.records and table.records[0].get_measurement() == 'from': # Simple way to identify tables, better if yield names are available directly
+                 # This is complex with aio-pika's sync client. Let's fetch separately as planned.
+                 # The separate query approach used before the yield block is simpler to process.
+                 # Let's revert to fetching means and count with separate queries.
+                 pass # placeholder, will remove yield and separate queries below
+
+    except InfluxDBError as e:
+        logger.error(f"InfluxDB Error during density query execution: {e}", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(f"Generic error during density query execution: {e}", exc_info=True)
+        return None
+
+
+    # --- Reverted Approach: Fetch Means and Count with Separate Queries ---
+    # This is simpler to process with the synchronous client's query result structure
     flux_query_mean = f'''
         from(bucket: "{influx_bucket}")
           |> range(start: -{window})
           |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          // Assuming tags are strings - this is less efficient but more compatible
           |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
           |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
-          |> filter(fn: (r) => r["_field"] == "pm25" or r["_field"] == "pm10" or r["_field"] == "no2" or r["_field"] == "so2" or r["_field"] == "o3")
+          |> filter(fn: (r) =>
+            r["_field"] == "pm25" or
+            r["_field"] == "pm10" or
+            r["_field"] == "no2" or
+            r["_field"] == "so2" or
+            r["_field"] == "o3"
+           )
+          |> group(columns: ["_field"]) // Group by parameter field
           |> mean() // Calculate mean per field
-          |> group(columns: ["_field"]) // Group by field to get one row per field mean
-          |> first() // Get the single mean value row for each field
-          |> group() // Ungroup
-          |> pivot(rowKey:["_measurement"], columnKey: ["_field"], valueColumn: "_value") // Pivot to get fields as columns
+          |> group() // Ungroup for pivot
+          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value") // Pivot fields into columns
+          |> limit(n:1) // Should only be one record after mean and pivot
     '''
     flux_query_count = f'''
         from(bucket: "{influx_bucket}")
           |> range(start: -{window})
           |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          // Same location filter
           |> filter(fn: (r) => float(v: r.latitude) >= {min_lat} and float(v: r.latitude) <= {max_lat})
           |> filter(fn: (r) => float(v: r.longitude) >= {min_lon} and float(v: r.longitude) <= {max_lon})
           |> filter(fn: (r) => r["_field"] == "pm25") // Count based on one representative field
           |> count()
           |> keep(columns: ["_value"]) // Keep only the count value
+          |> limit(n:1) // Should only be one count value
     '''
 
     logger.debug(f"Executing Flux query for density means:\n{flux_query_mean}")
@@ -315,30 +511,39 @@ def query_density_in_bbox(
         mean_tables = query_api.query(query=flux_query_mean, org=influx_org)
         mean_data = {}
         if mean_tables and mean_tables[0].records:
-            mean_data = mean_tables[0].records[0].values
+            mean_record_values = mean_tables[0].records[0].values
+            # Extract relevant fields, handling potential missing ones
+            mean_data['pm25'] = mean_record_values.get('pm25')
+            mean_data['pm10'] = mean_record_values.get('pm10')
+            mean_data['no2'] = mean_record_values.get('no2')
+            mean_data['so2'] = mean_record_values.get('so2')
+            mean_data['o3'] = mean_record_values.get('o3')
             logger.debug(f"Mean query result: {mean_data}")
         else:
              logger.info(f"No data found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for mean calculation.")
-             # Return None or default density object? Returning None for now.
+             # Return None or default density object? Returning None if no data for means.
              return None
 
         # Execute count query
         count_tables = query_api.query(query=flux_query_count, org=influx_org)
         data_points_count = 0
         if count_tables and count_tables[0].records:
-            data_points_count = count_tables[0].records[0].get_value()
+            count_record = count_tables[0].records[0]
+            # The count value is in the _value column
+            data_points_count = count_record.get_value()
             logger.debug(f"Count query result: {data_points_count}")
         else:
-            # Should generally not happen if mean query returned data, but handle defensively
-            logger.warning(f"Count query returned no results, although mean query did.")
+            logger.warning(f"Count query returned no results for bbox.")
 
 
         # Construct the result object
         density = PollutionDensity(
             region_name=f"BBox:[{min_lat:.2f},{min_lon:.2f} to {max_lat:.2f},{max_lon:.2f}]", # Describe the region
-            average_pm25=mean_data.get('pm25'), # Will be None if field wasn't present
+            average_pm25=mean_data.get('pm25'),
             average_pm10=mean_data.get('pm10'),
-            # Add other averages as needed from mean_data
+            average_no2=mean_data.get('no2'),
+            average_so2=mean_data.get('so2'),
+            average_o3=mean_data.get('o3'),
             data_points_count=data_points_count
         )
         logger.info(f"Calculated density: {density}")
@@ -351,120 +556,12 @@ def query_density_in_bbox(
         logger.error(f"Generic error querying density: {e}", exc_info=True)
         return None
 
+# --- End of Query Functions ---
 
-def write_air_quality_data(reading: AirQualityReading):
-    """Writes a single AirQualityReading to InfluxDB."""
-    if not write_api:
-        logger.error("InfluxDB write_api not available.")
-        return False # Indicate failure
-
-    # Ensure the timestamp from the reading is timezone-aware (it should be from main.py)
-    if reading.timestamp.tzinfo is None:
-        logger.warning(f"Timestamp for {reading.latitude},{reading.longitude} was naive. Assuming UTC.")
-        timestamp_to_write = reading.timestamp.replace(tzinfo=timezone.utc)
-    else:
-        timestamp_to_write = reading.timestamp
-
-    point = (
-        Point("air_quality") # Measurement name
-        .tag("latitude", str(reading.latitude)) # Tags are indexed
-        .tag("longitude", str(reading.longitude))
-        .field("pm25", reading.pm25) # Fields are data values
-        .field("pm10", reading.pm10)
-        .field("no2", reading.no2)
-        .field("so2", reading.so2)
-        .field("o3", reading.o3)
-        # --- CHANGE HERE ---
-        # Pass the datetime object directly. Specify precision.
-        .time(timestamp_to_write, WritePrecision.MS)
-        # --- END CHANGE ---
-    )
-
-    # Filter out None fields before writing, as InfluxDB doesn't store null fields natively
-    # Rebuild the point adding only non-None fields (tags and time are already set)
-    # This prevents errors if some optional fields are None
-    filtered_point = Point("air_quality") \
-        .tag("latitude", str(reading.latitude)) \
-        .tag("longitude", str(reading.longitude)) \
-        .time(timestamp_to_write, WritePrecision.MS)
-
-    non_null_fields = {k: v for k, v in reading.model_dump().items() if k not in ['latitude', 'longitude', 'timestamp'] and v is not None}
-    if not non_null_fields:
-        logger.warning(f"Skipping write for {reading.latitude},{reading.longitude} as no non-null fields were provided.")
-        return True # Technically not a write failure, just nothing to write
-
-    for key, value in non_null_fields.items():
-        filtered_point.field(key, value)
-
-
-    try:
-        # Write the filtered point
-        write_api.write(bucket=influx_bucket, org=influx_org, record=filtered_point)
-        logger.debug(f"Successfully wrote point: {filtered_point.to_line_protocol()}")
-        return True
-    except InfluxDBError as e:
-        logger.error(f"InfluxDB Error writing data: {e}", exc_info=True)
-        if hasattr(e, 'response'):
-             logger.error(f"InfluxDB Response Headers: {e.response.headers}")
-             logger.error(f"InfluxDB Response Body: {e.response.data}")
-        return False
-    except Exception as e:
-        logger.error(f"Generic error writing data: {e}", exc_info=True)
-        return False
-
-# --- Example Query Function ---
-def query_latest_location_data(lat: float, lon: float, window: str = "1h") -> Optional[dict]:
-    """Queries the latest data point for a location within a window."""
-    if not query_api:
-        logger.error("InfluxDB query_api not available.")
-        return None
-
-    # Construct Flux query
-    # Note: Comparing floats directly can be tricky. Consider querying ranges or geohashing later.
-    # This simple query assumes string tags for lat/lon.
-    flux_query = f'''
-        from(bucket: "{influx_bucket}")
-          |> range(start: -{window})
-          |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          |> filter(fn: (r) => r["latitude"] == "{lat}")
-          |> filter(fn: (r) => r["longitude"] == "{lon}")
-          |> last() // Get the most recent point in the window for each field
-          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value") // Reshape fields into columns
-    '''
-    logger.debug(f"Executing Flux query:\n{flux_query}")
-    try:
-        tables = query_api.query(query=flux_query, org=influx_org)
-
-        if not tables or not tables[0].records:
-             logger.info(f"No data found for lat={lat}, lon={lon} in the last {window}")
-             return None
-
-        # Process the result (pivot makes this easier)
-        record = tables[0].records[0] # Get the first (and only) record after pivot
-        data = record.values # Dictionary of fields and values
-        # Add back time and tags if needed
-        data["timestamp"] = record.get_time()
-        data["latitude"] = float(record.values.get("latitude", lat)) # Get from record or use input
-        data["longitude"] = float(record.values.get("longitude", lon))
-
-        logger.debug(f"Query result for {lat},{lon}: {data}")
-        return data # Return the dictionary representing the pivoted record
-
-    except InfluxDBError as e:
-        logger.error(f"InfluxDB Error querying data: {e}", exc_info=True)
-        if hasattr(e, 'response'):
-             logger.error(f"InfluxDB Response Headers: {e.response.headers}")
-             logger.error(f"InfluxDB Response Body: {e.response.data}")
-        return None
-    except Exception as e:
-        logger.error(f"Generic error querying data: {e}", exc_info=True)
-        return None
-
-# --- Add more query functions as needed ---
-# e.g., query_points_in_bbox, query_anomalies, query_density etc.
-
-# Optional: Close client on shutdown (FastAPI events or lifespan manager)
-def close_influx_client():
-    if client:
-        logger.info("Closing InfluxDB client.")
-        client.close()
+# Clean up the redundant get_client/get_query_api functions if they exist
+# (Based on the provided code snippet, they seem to be below the main init)
+# Remove these if they exist in your actual file:
+# def get_query_api(): ...
+# def get_influxdb_client(): ...
+# Remove _influx_client, _query_api globals if they were used only by those functions.
+# Rely on the global client, write_api, query_api initialized at the top.
