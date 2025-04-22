@@ -1,9 +1,8 @@
 # backend/app/aggregation.py (New file)
 import geohash # Import the library
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple,Optional
 from collections import defaultdict
 from .models import AirQualityReading # Assuming models.py is in the same directory level
-
 # Define the structure for aggregated results per geohash cell
 class AggregatedData:
     def __init__(self):
@@ -51,8 +50,19 @@ class AggregatedData:
         }
 
 
-def aggregate_by_geohash(points: List[AirQualityReading], precision: int = 6) -> List[Dict]:
-    """Aggregates air quality readings by geohash."""
+def aggregate_by_geohash(points: List[AirQualityReading], precision: int = 6, max_cells: Optional[int] = None) -> List[Dict]: # Add max_cells parameter
+    """
+    Aggregates air quality readings by geohash.
+
+    Args:
+        points: List of AirQualityReading objects.
+        precision: The geohash precision level (length of the geohash string).
+        max_cells: Optional maximum number of aggregated cells to return.
+                   If specified, the list might be truncated.
+
+    Returns:
+        A list of dictionaries, each representing an aggregated geohash cell.
+    """
     if not points:
         return []
 
@@ -63,12 +73,9 @@ def aggregate_by_geohash(points: List[AirQualityReading], precision: int = 6) ->
             continue # Skip points without coordinates
 
         try:
-            # Calculate geohash for the point
             gh = geohash.encode(point.latitude, point.longitude, precision=precision)
-            # Add the point's data to the corresponding geohash cell
             aggregated_cells[gh].add_reading(point)
         except Exception as e:
-            # Handle potential errors during geohash encoding if coordinates are invalid
             print(f"Could not process point: {point}, Error: {e}")
             continue
 
@@ -79,4 +86,10 @@ def aggregate_by_geohash(points: List[AirQualityReading], precision: int = 6) ->
         if avg_point:
             result_list.append(avg_point)
 
-    return result_list
+    # Apply limit if specified
+    if max_cells is not None and len(result_list) > max_cells:
+         # Optional: You could sort here before truncating, e.g., by count
+         # result_list.sort(key=lambda x: x['count'], reverse=True)
+         return result_list[:max_cells]
+    else:
+        return result_list
