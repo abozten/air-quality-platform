@@ -141,19 +141,22 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
 
     # Default time range (e.g., last 24 hours) if not provided
     if start_time is None and end_time is None:
-        range_filter = f'|> range(start: -24h)'
+        range_filter = f'|> range(start: -24h)' # Default range is fine
     elif start_time and end_time:
          # Ensure timezone-aware before formatting
-         start_iso = start_time.astimezone(timezone.utc).isoformat(timespec='seconds') + 'Z' if start_time else ''
-         end_iso = end_time.astimezone(timezone.utc).isoformat(timespec='seconds') + 'Z' if end_time else ''
+         # CORRECTED: Remove manual '+ 'Z''
+         start_iso = start_time.astimezone(timezone.utc).isoformat()
+         end_iso = end_time.astimezone(timezone.utc).isoformat()
          range_filter = f'|> range(start: {start_iso}, stop: {end_iso})'
     elif start_time:
-         start_iso = start_time.astimezone(timezone.utc).isoformat(timespec='seconds') + 'Z' if start_time else ''
+         # CORRECTED: Remove manual '+ 'Z''
+         start_iso = start_time.astimezone(timezone.utc).isoformat()
          range_filter = f'|> range(start: {start_iso})'
     else: # Only end_time provided
-        end_iso = end_time.astimezone(timezone.utc).isoformat(timespec='seconds') + 'Z' if end_time else ''
-        # Need a start, perhaps default to beginning of time or a reasonable past limit
-        range_filter = f'|> range(start: 0, stop: {end_iso})' # Or range(start: -30d, stop: ...)
+        # CORRECTED: Remove manual '+ 'Z''
+        end_iso = end_time.astimezone(timezone.utc).isoformat()
+        # Default start to 0 (beginning of Unix time) is suitable for InfluxDB
+        range_filter = f'|> range(start: 0, stop: {end_iso})'
 
 
     # Flux query to get anomaly records
@@ -161,15 +164,17 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
         from(bucket: "{influx_bucket}")
           {range_filter}
           |> filter(fn: (r) => r["_measurement"] == "air_quality_anomalies")
-          |> filter(fn: (r) => exists r.latitude and exists r.longitude and exists r.parameter and exists r.value and exists r.description and exists r.id) // Ensure required fields/tags exist
-          |> pivot(rowKey:["_time", "latitude", "longitude", "parameter", "id"], columnKey: ["_field"], valueColumn: "_value") // Include tags in rowKey if they are unique per event
-          // Add sorting if needed: |> sort(columns: ["_time"], desc: true)
+          // Ensure necessary fields/tags exist for parsing
+          |> filter(fn: (r) => exists r.latitude and exists r.longitude and exists r.parameter and exists r.value and exists r.description and exists r.id)
+          // Pivot includes tags needed to uniquely identify the anomaly event row
+          |> pivot(rowKey:["_time", "id", "latitude", "longitude", "parameter"], columnKey: ["_field"], valueColumn: "_value")
+          |> sort(columns: ["_time"], desc: true) // Optional: sort by time descending
     '''
     logger.debug(f"Executing Flux query for anomalies:\n{flux_query}")
 
     results: List[Anomaly] = []
     try:
-        tables = query_api.query(query=flux_query, org=influx_org)
+        tables = query_api.query(query=flux_query, org=influx_org) # LINE 172 where error occurred
         if not tables:
             logger.info("No anomalies found in the specified range.")
             return []
@@ -178,48 +183,52 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
             for record in table.records:
                  try:
                     data = record.values
-                    # Tags should be directly available after pivot if in rowKey
+                    # Tags are included in the pivoted rowKey and should be directly accessible
                     lat_str = data.get("latitude")
                     lon_str = data.get("longitude")
                     param_str = data.get("parameter")
                     id_str = data.get("id")
-                    val_float = data.get("value") # Field
-                    desc_str = data.get("description") # Field
+                    val_float = data.get("value") # This is a field from pivot
+                    desc_str = data.get("description") # This is a field from pivot
 
+                    # Basic check for required fields/tags after pivot
                     if None in [lat_str, lon_str, param_str, id_str, val_float, desc_str]:
-                        logger.warning(f"Skipping anomaly record due to missing fields/tags: {data}")
+                        logger.warning(f"Skipping anomaly record due to missing fields/tags after pivot: {data}")
                         continue
 
                     anomaly = Anomaly(
                         id=str(id_str),
                         latitude=float(lat_str),
                         longitude=float(lon_str),
-                        timestamp=record.get_time(),
+                        timestamp=record.get_time(), # Get timestamp from record metadata
                         parameter=str(param_str),
                         value=float(val_float),
                         description=str(desc_str)
                     )
                     results.append(anomaly)
-                 except (ValueError, TypeError) as e:
-                    logger.error(f"Error processing anomaly record (ValueError/TypeError): {e} - Record: {record.values}", exc_info=False)
+                 except (ValueError, TypeError, KeyError) as e: # Catch potential parsing errors
+                    logger.error(f"Error processing anomaly record (parsing/type error): {e} - Record: {record.values}", exc_info=False)
                     continue # Skip faulty record
                  except Exception as e:
-                    logger.error(f"Error processing anomaly record: {e} - Record: {record.values}", exc_info=True)
+                    logger.error(f"Unexpected error processing anomaly record: {e} - Record: {record.values}", exc_info=True)
                     continue # Skip faulty record
 
         logger.info(f"Found {len(results)} anomalies.")
         return results
 
     except InfluxDBError as e:
-        if "no series found" in str(e).lower() or "no data found" in str(e).lower():
+        # Check if the error is the specific "invalid" code from the log
+        if e.response and e.response.status == 400:
+            logger.error(f"InfluxDB Bad Request (400) querying anomalies. Invalid Flux Query likely. Error: {e}", exc_info=True)
+            logger.error(f"InfluxDB Response Body: {e.response.data}") # Log body for details
+        elif "no series found" in str(e).lower() or "no data found" in str(e).lower():
              logger.info("No anomaly data found for the specified query.")
-             return []
-        logger.error(f"InfluxDB Error querying anomalies: {e}", exc_info=True)
-        return []
+        else:
+            logger.error(f"InfluxDB Error querying anomalies: {e}", exc_info=True)
+        return [] # Return empty list on error
     except Exception as e:
         logger.error(f"Generic error querying anomalies: {e}", exc_info=True)
         return []
-
 def write_anomaly_data(anomaly: Anomaly):
     """Writes a detected Anomaly to InfluxDB."""
     if not write_api:
