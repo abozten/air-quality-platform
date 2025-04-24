@@ -1,6 +1,6 @@
 // frontend/src/components/MapComponent.jsx
 import React, { useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, useMap, Marker, Tooltip } from 'react-leaflet';
+import { MapContainer, TileLayer, useMap, Marker, Tooltip, ZoomControl } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import 'leaflet.heat';
@@ -85,18 +85,18 @@ const HeatmapLayer = ({ points, selectedParam }) => {
       default: maxIntensity = 50.0; break;
     }
 
-    // Configure heatmap options
+    // Configure heatmap options - adjusted for dark mode
     const heatOptions = {
       radius: 20,
       blur: 15,
       maxZoom: 11,
       max: maxIntensity,
       gradient: {
-        0.4: 'blue',
-        0.6: 'cyan',
-        0.7: 'lime',
-        0.8: 'yellow',
-        1.0: 'red'
+        0.3: '#2c3e50',
+        0.5: '#3498db',
+        0.7: '#2ecc71',
+        0.8: '#f1c40f',
+        1.0: '#e74c3c'
       }
     };
 
@@ -121,6 +121,34 @@ const HeatmapLayer = ({ points, selectedParam }) => {
   return null;
 };
 
+// Map style customization component
+const MapStyleCustomization = () => {
+  const map = useMap();
+  
+  useEffect(() => {
+    // Apply dark mode styling to the map
+    map.getContainer().classList.add('dark-mode-map');
+    
+    // Reduce zoom controls opacity for minimalist look
+    const zoomControl = document.querySelector('.leaflet-control-zoom');
+    if (zoomControl) {
+      zoomControl.style.opacity = '0.7';
+    }
+    
+    // Reduce attribution opacity
+    const attribution = document.querySelector('.leaflet-control-attribution');
+    if (attribution) {
+      attribution.style.opacity = '0.5';
+      attribution.style.background = 'rgba(0, 0, 0, 0.5)';
+      attribution.style.color = '#aaa';
+      attribution.style.padding = '2px 5px';
+      attribution.style.fontSize = '9px';
+    }
+  }, [map]);
+  
+  return null;
+};
+
 // Main MapComponent
 const MapComponent = ({ points = [], anomalies = [], selectedParam = 'pm25' }) => {
   const initialPosition = [20, 0];
@@ -132,13 +160,17 @@ const MapComponent = ({ points = [], anomalies = [], selectedParam = 'pm25' }) =
       zoom={initialZoom} 
       style={{ height: '70vh', width: '100%' }}
       worldCopyJump={true}
+      zoomControl={false} // Disable default zoom control to reposition it
     >
+      {/* Dark mode tile layer */}
       <TileLayer
-        attribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        attribution='&copy; <a href="https://stadiamaps.com/">Stadia Maps</a>, &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a>'
+        url="https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png"
       />
       <HeatmapLayer points={points} selectedParam={selectedParam} />
       <AnomalyMarkers anomalies={anomalies} />
+      <MapStyleCustomization />
+      <ZoomControl position="bottomright" />
     </MapContainer>
   );
 };
