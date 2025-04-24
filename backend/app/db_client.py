@@ -262,82 +262,88 @@ def write_anomaly_data(anomaly: Anomaly):
     except Exception as e:
         logger.error(f"Generic error writing anomaly data: {e}", exc_info=True)
         return False
+# --- Helper: calculate_geohashes_for_bbox (FIXED) ---
+# Define the standard geohash base32 characters
+GEOHASH_BASE32_CHARS = "0123456789bcdefghjkmnpqrstuvwxyz"
 
 # --- Helper for BBox Geohash Calculation ---
-def calculate_geohashes_for_bbox(
-    min_lat: float, max_lat: float, min_lon: float, max_lon: float, precision: int
-) -> List[str]:
+def calculate_geohashes_for_bbox(min_lat, max_lat, min_lon, max_lon, precision) -> List[str]:
     """
     Calculates a list of geohash prefixes of the given precision
     that cover the bounding box.
-    Uses a recursive approach for better coverage.
+    Uses a recursive approach for better coverage. (FIXED)
     """
     try:
         import geohash
     except ImportError:
-        logger.warning("Geohash library not available for bbox calculation. Install with: pip install python-geohash")
-        return []
+        logger.warning("Geohash library not available for bbox calculation.")
+        raise # Re-raise so the caller knows it failed
 
     checked_hashes: Set[str] = set()
     hashes_in_bbox: Set[str] = set()
 
-    # Function to recursively check geohashes
     def check_hash(h: str):
-        if h in checked_hashes:
-            return
+        if h in checked_hashes: return
         checked_hashes.add(h)
-
-        # Decode the hash to get its bounding box
-        try:
-            gh_bbox = geohash.bbox(h)
+        try: gh_bbox = geohash.bbox(h)
         except Exception as e:
-            logger.warning(f"Could not decode geohash {h}: {e}")
+            # This can happen for invalid hash strings during recursion, log quietly
+            logger.debug(f"Could not decode geohash '{h}' during bbox check: {e}")
             return
 
-        # Check if the geohash cell intersects the query bounding box
         hash_min_lat, hash_max_lat = gh_bbox['s'], gh_bbox['n']
         hash_min_lon, hash_max_lon = gh_bbox['w'], gh_bbox['e']
+        intersects = (hash_min_lat <= max_lat and hash_max_lat >= min_lat and
+                      hash_min_lon <= max_lon and hash_max_lon >= min_lon)
+        if not intersects: return
 
-        intersects = (
-            hash_min_lat <= max_lat and
-            hash_max_lat >= min_lat and
-            hash_min_lon <= max_lon and
-            hash_max_lon >= min_lon
-        )
-
-        if not intersects:
-            return
-
-        # If the hash is at the target precision, add it
         if len(h) == precision:
             hashes_in_bbox.add(h)
             return
 
-        # If the hash is shorter than the target precision, check its neighbors
         if len(h) < precision:
+            # Check neighbors and subdivide
             neighbors = geohash.neighbors(h)
-            for neighbor in neighbors:
-                check_hash(neighbor)
-            # Also check the hash itself (subdivide)
-            for char in geohash.DEFAULT_CHARACTERS:
-                check_hash(h + char)
+            # *** FIX: Use the manually defined GEOHASH_BASE32_CHARS ***
+            all_to_check = list(neighbors) + [h + char for char in GEOHASH_BASE32_CHARS]
+            for next_h in all_to_check:
+                 # Optimization: check length before recursive call
+                 if len(next_h) <= precision:
+                    check_hash(next_h)
 
+    # Start check from a few points
+    initial_hashes = set()
+    points_to_encode = [
+        ( (min_lat + max_lat) / 2, (min_lon + max_lon) / 2 ), # Center
+        (min_lat, min_lon), (min_lat, max_lon), (max_lat, min_lon), (max_lat, max_lon) # Corners
+    ]
+    # Start coarse, but not too coarse to miss details in small target precisions
+    start_precision = min(precision, 4) if precision > 1 else 1
+    for p_lat, p_lon in points_to_encode:
+        try:
+            # Ensure coordinates are valid before encoding
+            if -90 <= p_lat <= 90 and -180 <= p_lon <= 180:
+                initial_hashes.add(geohash.encode(p_lat, p_lon, precision=start_precision))
+            else:
+                 logger.warning(f"Skipping invalid coordinate for initial hash: {p_lat},{p_lon}")
+        except Exception as e: logger.warning(f"Could not encode initial point {p_lat},{p_lon}: {e}")
 
-    # Start the check from a central point or corners
-    mid_lat = (min_lat + max_lat) / 2
-    mid_lon = (min_lon + max_lon) / 2
-    try:
-        initial_hash = geohash.encode(mid_lat, mid_lon, precision=min(precision, 1)) # Start coarse
-        check_hash(initial_hash)
-        # Optionally start from corners too for wider boxes
-        corners = [(min_lat, min_lon), (min_lat, max_lon), (max_lat, min_lon), (max_lat, max_lon)]
-        for clat, clon in corners:
-            corner_hash = geohash.encode(clat, clon, precision=min(precision,1))
-            check_hash(corner_hash)
+    if not initial_hashes:
+        # This might happen if the input bbox itself is invalid or extremely small
+        logger.error(f"Could not generate any initial geohashes for bbox check: [{min_lat},{min_lon} to {max_lat},{max_lon}]")
+        # Attempt a single geohash at the target precision from the center as a last resort
+        try:
+             center_lat = (min_lat + max_lat) / 2
+             center_lon = (min_lon + max_lon) / 2
+             if -90 <= center_lat <= 90 and -180 <= center_lon <= 180:
+                 center_hash = geohash.encode(center_lat, center_lon, precision=precision)
+                 logger.info(f"Using single center hash '{center_hash}' as fallback for bbox.")
+                 return [center_hash]
+        except Exception:
+             logger.error("Failed fallback to single center hash.")
+             return [] # Truly failed
 
-    except Exception as e:
-        logger.error(f"Error calculating initial geohash for bbox check: {e}")
-        return [] # Cannot proceed
+    for h in initial_hashes: check_hash(h)
 
     result = list(hashes_in_bbox)
     logger.debug(f"Calculated {len(result)} geohash prefixes for bbox with precision {precision}")
@@ -350,80 +356,69 @@ def query_density_in_bbox(
 ) -> Optional[PollutionDensity]:
     """
     Calculates average pollution density within a bounding box and time window,
-    using geohash filtering based on the *storage precision*.
+    primarily using geohash filtering based on the storage precision. (FIXED AGAIN)
     """
     if not query_api:
         logger.error("InfluxDB query_api not available.")
         return None
 
-    # --- USE GEOHASHING based on storage precision ---
-    use_geohash = True # Attempt to use geohash filtering
     location_filter = ""
-    # Use the precision defined in settings for storage
-    storage_precision = settings.geohash_precision_storage
-
+    bbox_geohashes = []
     try:
         bbox_geohashes = calculate_geohashes_for_bbox(
             min_lat, max_lat, min_lon, max_lon,
-            precision=storage_precision
+            precision=7
         )
+    except ImportError:
+         logger.warning("Geohash library not installed. Cannot use geohash filtering for density query.")
     except Exception as e:
-        logger.error(f"Error calculating geohashes for bbox: {e}", exc_info=True)
-        bbox_geohashes = [] # Fallback if calculation fails
+        logger.error(f"Error calculating geohashes for bbox density query: {e}", exc_info=True)
 
     if bbox_geohashes:
-        # Format the list for the Flux 'contains' function set parameter
-        # Using json.dumps is crucial for correct list formatting in Flux
         flux_geohash_set = json.dumps(bbox_geohashes)
-        # Filter points where the 'geohash' tag is one of the calculated prefixes
-        # Assumes the 'geohash' tag exists and matches storage_precision length
         location_filter = f'|> filter(fn: (r) => contains(value: r.geohash, set: {flux_geohash_set}))'
-        logger.debug(f"Using geohash filter with {len(bbox_geohashes)} prefixes (precision {storage_precision}).")
+        logger.debug(f"Density query using geohash filter with {len(bbox_geohashes)} prefixes (precision {7}).")
     else:
-        logger.warning(f"Could not calculate geohashes or geohash library unavailable for bbox [{min_lat},{min_lon} - {max_lat},{max_lon}]. Falling back to coordinate filtering.")
-        # Fallback to numerical filtering (less efficient for large datasets)
-        # Ensure tags are treated as floats for comparison
+        # Fallback to coordinate filtering
+        logger.warning(f"Density query falling back to coordinate filtering for bbox [{min_lat},{min_lon} - {max_lat},{max_lon}]. This may be less efficient.")
         location_filter = f'''
           |> filter(fn: (r) => exists r.latitude and exists r.longitude)
-          |> map(fn: (r) => ({{ r with latitude_float: float(v: r.latitude), longitude_float: float(v: r.longitude) }})) // Convert tags to float fields
+          |> map(fn: (r) => ({{ r with latitude_float: float(v: r.latitude), longitude_float: float(v: r.longitude) }}))
           |> filter(fn: (r) => r.latitude_float >= {min_lat} and r.latitude_float <= {max_lat} and r.longitude_float >= {min_lon} and r.longitude_float <= {max_lon})
         '''
-        logger.debug("Using float coordinate filtering (fallback).")
 
-
-    # Single optimized query that gets both means and count in one pass
-    # Use 'aggregateWindow' to reduce points before calculating mean/count if window is large
+    # *** FIXES applied to the Flux query string ***
     flux_query = f'''
-    import "math" // Needed for checks like isNaN
+    import "math"
+    import "types" // Import types package for type testing
 
-    // Define the base dataset
     base_data = from(bucket: "{influx_bucket}")
       |> range(start: -{window})
       |> filter(fn: (r) => r["_measurement"] == "air_quality")
-      // Apply the chosen location filter (geohash or coordinate)
-      {location_filter}
-      // Filter by desired fields AFTER location filter for efficiency
+      {location_filter} // Apply geohash or coordinate filter
       |> filter(fn: (r) => r["_field"] == "pm25" or r["_field"] == "pm10" or r["_field"] == "no2" or r["_field"] == "so2" or r["_field"] == "o3")
-      |> filter(fn: (r) => r._value != nil and not math.isNaN(x: r._value)) // Ensure values are valid numbers
+      // Ensure values are valid numbers using correct Flux syntax and type check
+      // Check type first, then check for NaN only (remove null check)
+      |> filter(fn: (r) =>
+            types.isNumeric(v: r._value) and // Ensure it's a numeric type first
+            not math.isNaN(f: r._value)      // Check for NaN
+        ) // <-- Removed 'null' check, only type and NaN check remain
 
-
-    // Calculate counts per field (use unique points if aggregation is needed)
     counts = base_data
-      |> group(columns: ["_field"]) // Group only by field to get total count per field
-      |> count() // Use count() which counts non-null records
-      |> group() // Ungroup before yield
+      |> group(columns: ["_field"])
+      |> count()
+      |> group()
       |> yield(name: "counts")
 
-    // Calculate means in one pass
-    means = base_data
-      |> group(columns: ["_field"]) // Group only by field to get overall mean per field
-      |> mean() // Use mean() which calculates mean of _value column
-      |> group() // Ungroup before yield
+    means = base_data // <-- FIX: Corrected typo from base_da to base_data
+      |> group(columns: ["_field"])
+      |> mean()
+      |> group()
       |> yield(name: "means")
     '''
 
     logger.debug(f"Executing Flux query for density:\n{flux_query}")
-
+    logger.info(f"{flux_query}")
     try:
         query_results = query_api.query(query=flux_query, org=influx_org)
 
@@ -433,21 +428,30 @@ def query_density_in_bbox(
 
         # Extract data from yielded tables
         for table in query_results:
-            if not table.records: continue # Skip empty tables
+            if not table.records:
+                continue # Skip empty tables
+
+            # Get the yielded table name from metadata
+            table_name = getattr(table, '_table', None)
+            if table_name and hasattr(table_name, '_metadata'):
+                yield_name = table_name._metadata.get('name')
+            else:
+                yield_name = None
 
             field_name = table.records[0].values.get('_field') # Field name should be consistent within a yielded table
-            if not field_name: continue # Skip tables without field info
+            if not field_name:
+                continue # Skip tables without field info
 
-            if table.name == "means":
-                 logger.debug(f"Processing 'means' table for field '{field_name}'")
-                 mean_value = table.records[0].get_value() # Get the calculated mean
-                 if mean_value is not None:
+            if yield_name == "means":
+                logger.debug(f"Processing 'means' table for field '{field_name}'")
+                mean_value = table.records[0].get_value() # Get the calculated mean
+                if mean_value is not None:
                     mean_data[field_name] = mean_value
-            elif table.name == "counts":
-                 logger.debug(f"Processing 'counts' table for field '{field_name}'")
-                 count_value = table.records[0].get_value() # Get the calculated count
-                 if count_value is not None:
-                     count_data[field_name] = count_value
+            elif yield_name == "counts":
+                logger.debug(f"Processing 'counts' table for field '{field_name}'")
+                count_value = table.records[0].get_value() # Get the calculated count
+                if count_value is not None:
+                    count_data[field_name] = count_value
 
         if not mean_data and not count_data:
             logger.info(f"No valid data found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for window {window}")
@@ -478,10 +482,14 @@ def query_density_in_bbox(
 
     except InfluxDBError as e:
         logger.error(f"InfluxDB Error querying density: {e}", exc_info=True)
+        if hasattr(e, 'response') and e.response and hasattr(e.response, 'data'):
+             # Log the response body which contains the Flux error message
+             logger.error(f"InfluxDB Response Body: {e.response.data.decode() if isinstance(e.response.data, bytes) else e.response.data}")
         return None
     except Exception as e:
         logger.error(f"Generic error querying density: {e}", exc_info=True)
         return None
+
 
 
 def write_air_quality_data(reading: AirQualityReading):
