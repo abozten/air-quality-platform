@@ -2,14 +2,15 @@
 import React, { useState, useEffect } from 'react';
 import MapComponent from './components/MapComponent';
 import AnomalyPanel from './components/AnomalyPanel';
-import * as api from './services/api'; // Import API service
+import PollutionChart from './components/PollutionChart';
+import * as api from './services/api';
 import './App.css';
 
 function App() {
   const [mapPoints, setMapPoints] = useState([]);
   const [anomalies, setAnomalies] = useState([]);
-  const [selectedLocationData, setSelectedLocationData] = useState(null);
-  const [selectedParam, setSelectedParam] = useState('pm25'); // Default to PM2.5
+  const [pollutionData, setPollutionData] = useState({});
+  const [selectedParam, setSelectedParam] = useState('pm25');
   const [isLoadingPoints, setIsLoadingPoints] = useState(false);
   const [isLoadingAnomalies, setIsLoadingAnomalies] = useState(false);
   const [errorPoints, setErrorPoints] = useState(null);
@@ -22,7 +23,7 @@ function App() {
       setIsLoadingPoints(true);
       setErrorPoints(null);
       try {
-        const pointsData = await api.fetchAirQualityPoints(200); // Fetch 200 points
+        const pointsData = await api.fetchAirQualityPoints(200);
         setMapPoints(pointsData);
       } catch (err) {
         console.error("Failed to fetch map points:", err);
@@ -35,7 +36,6 @@ function App() {
       setIsLoadingAnomalies(true);
       setErrorAnomalies(null);
       try {
-         // Fetch anomalies for the last 24 hours (default in API)
         const anomalyData = await api.fetchAnomalies();
         setAnomalies(anomalyData);
       } catch (err) {
@@ -47,42 +47,48 @@ function App() {
     };
 
     loadInitialData();
-  }, []); // Empty dependency array means this runs once on mount
+    
+    // Auto-refresh data every 5 minutes
+    const refreshInterval = setInterval(() => {
+      loadInitialData();
+    }, 5 * 60 * 1000);
+    
+    return () => clearInterval(refreshInterval);
+  }, []);
 
-  // Function to handle clicks on map markers
-  const handleMarkerClick = async (point) => {
-    console.log("Marker clicked:", point);
-    // Optional: Fetch more detailed data for the clicked point if needed
-    // setSelectedLocationData(point); // Simple display of clicked data
-    // Or make a new API call:
-    // const detailedData = await api.fetchAirQualityForLocation(point.latitude, point.longitude);
-    // setSelectedLocationData(detailedData);
-  };
-
+  // Handle parameter change for the heatmap
   const handleParamChange = (event) => {
     setSelectedParam(event.target.value);
   };
 
-   // Function to handle clicks directly on the map (optional)
-   const handleMapClick = (latlng) => {
-       console.log("Map clicked at:", latlng);
-       // You could potentially fetch data for this clicked coordinate
-       // Or trigger adding a new manual data point entry form etc.
-   }
-
   return (
     <div className="App">
+      {/* Header & Navigation */}
       <header className="App-header">
-        <h1>World Air Quality Monitor</h1>
+        <h1>AirMon</h1>
+        <div className="nav-links">
+          <a href="#" className="active">Home</a>
+          <a href="#">Detailed Analysis</a>
+          <a href="#">About</a>
+          <a href="#">API Docs</a>
+        </div>
       </header>
 
+      {/* Main Content */}
       <div className="main-content">
-        <div className="map-container-wrapper">
+        {/* Hero Section */}
+        <section className="hero-section">
+          <h2>Air Monitoring Platform</h2>
+          <p>A web-based platform for collecting, analyzing, and visualizing air pollution data worldwide.</p>
+        </section>
 
-          {/* **************************************** */}
-          {/* Parameter Selection Dropdown */}
-          <div className="parameter-selector">
-            <label htmlFor="param-select">Heatmap Parameter: </label>
+        {/* Map Section */}
+        <div className="map-container">
+          {isLoadingPoints && <div className="loading-overlay">Loading map data...</div>}
+          {errorPoints && <div className="error-message">Error loading map data: {errorPoints}</div>}
+          
+          <div className="map-controls">
+            <label htmlFor="param-select">Display Parameter: </label>
             <select id="param-select" value={selectedParam} onChange={handleParamChange}>
               <option value="pm25">PM2.5</option>
               <option value="pm10">PM10</option>
@@ -91,29 +97,25 @@ function App() {
               <option value="o3">O₃</option>
             </select>
           </div>
-          {/* **************************************** */}
-
-          <h2>Air Quality Heatmap ({selectedParam.toUpperCase()})</h2> {/* Dynamic Title */}
-          {isLoadingPoints && <p>Loading map data...</p>}
-          {errorPoints && <p style={{ color: 'red' }}>Error loading map data: {errorPoints}</p>}
-
-          {/* **************************************** */}
-          {/* Pass selectedParam down to MapComponent */}
-          <MapComponent
-            points={mapPoints}
-            selectedParam={selectedParam} // Pass the state down
+          
+          <MapComponent 
+            points={mapPoints} 
+            anomalies={anomalies} 
+            selectedParam={selectedParam}
           />
-          {/* **************************************** */}
-
         </div>
 
-        <div className="sidebar">
-          <AnomalyPanel
+        {/* Panels Section */}
+        <div className="panels-section">
+          {/* Air Pollution Level Charts */}
+          <PollutionChart pollutionData={pollutionData} />
+          
+          {/* Anomaly Panel */}
+          <AnomalyPanel 
             anomalies={anomalies}
             isLoading={isLoadingAnomalies}
             error={errorAnomalies}
           />
-          {/* ... other sidebar content ... */}
         </div>
       </div>
     </div>
