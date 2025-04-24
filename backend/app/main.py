@@ -1,7 +1,7 @@
 # backend/app/main.py
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 import logging
 from fastapi import FastAPI, Query, HTTPException, Body, status
@@ -109,7 +109,7 @@ async def get_aggregated_air_quality_points(
     response_model=List[Anomaly],
     summary="List Detected Anomalies",
     description="Lists anomalies detected and stored in the database within a specified time range. Defaults to the last 24 hours."
-    )
+)
 async def list_anomalies(
     start_time: Optional[datetime] = Query(None, description="Start time for filtering anomalies (ISO 8601 format, e.g., 2023-10-27T10:00:00Z)."),
     end_time: Optional[datetime] = Query(None, description="End time for filtering anomalies (ISO 8601 format). Defaults to now if start_time is provided.")
@@ -117,8 +117,22 @@ async def list_anomalies(
     """
     Retrieves stored anomaly records. Requires a separate process (like the worker)
     to detect and write anomalies to the `air_quality_anomalies` measurement.
+    If no time range is provided, defaults to the last 24 hours.
     """
     logger.info(f"Request received for anomalies: start={start_time}, end={end_time}")
+
+    now = datetime.now(timezone.utc)
+    # Default to last 24h if both are None
+    if start_time is None and end_time is None:
+        end_time = now
+        start_time = now - timedelta(hours=24)
+    # If only start_time is provided, default end_time to now
+    elif start_time is not None and end_time is None:
+        end_time = now
+    # If only end_time is provided, default start_time to 24h before end_time
+    elif start_time is None and end_time is not None:
+        start_time = end_time - timedelta(hours=24)
+
     # Add timezone info if naive (assume UTC for query consistency)
     if start_time and start_time.tzinfo is None:
         start_time = start_time.replace(tzinfo=timezone.utc)
