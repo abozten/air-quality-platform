@@ -160,14 +160,18 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
 
 
     # Flux query to get anomaly records
+    # Flux query to get anomaly records
     flux_query = f'''
         from(bucket: "{influx_bucket}")
           {range_filter}
           |> filter(fn: (r) => r["_measurement"] == "air_quality_anomalies")
-          // Ensure necessary fields/tags exist for parsing
-          |> filter(fn: (r) => exists r.latitude and exists r.longitude and exists r.parameter and exists r.value and exists r.description and exists r.id)
+          // CORRECTED FILTER: Ensure necessary TAGS exist, and the FIELD is one we will pivot.
+          |> filter(fn: (r) => exists r.latitude and exists r.longitude and exists r.parameter and exists r.id) // Check tags
+          |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "description") // Check if field is one of the expected ones
           // Pivot includes tags needed to uniquely identify the anomaly event row
           |> pivot(rowKey:["_time", "id", "latitude", "longitude", "parameter"], columnKey: ["_field"], valueColumn: "_value")
+          // Optional: Add a filter *after* pivot if you STRICTLY require both value and description to be present
+          // |> filter(fn: (r) => exists r.value and exists r.description)
           |> sort(columns: ["_time"], desc: true) // Optional: sort by time descending
     '''
     logger.debug(f"Executing Flux query for anomalies:\n{flux_query}")
@@ -175,6 +179,7 @@ def query_anomalies_from_db(start_time: Optional[datetime] = None, end_time: Opt
     results: List[Anomaly] = []
     try:
         tables = query_api.query(query=flux_query, org=influx_org) # LINE 172 where error occurred
+        
         if not tables:
             logger.info("No anomalies found in the specified range.")
             return []

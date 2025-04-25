@@ -122,12 +122,8 @@ async def list_anomalies(
     logger.info(f"Request received for anomalies: start={start_time}, end={end_time}")
 
     now = datetime.now(timezone.utc)
-    # Default to last 24h if both are None
-    if start_time is None and end_time is None:
-        end_time = now
-        start_time = now - timedelta(hours=24)
     # If only start_time is provided, default end_time to now
-    elif start_time is not None and end_time is None:
+    if start_time is not None and end_time is None:
         end_time = now
     # If only end_time is provided, default start_time to 24h before end_time
     elif start_time is None and end_time is not None:
