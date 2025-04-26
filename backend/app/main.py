@@ -17,6 +17,9 @@ from .db_client import (
 from . import db_client # Keep for close_influx_client call
 from . import queue_client
 from .aggregation import aggregate_by_geohash # Import aggregation function
+from .config import get_settings # Import get_settings
+
+settings = get_settings() # Get settings instance
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -178,31 +181,48 @@ async def get_pollution_density_for_bbox(
     return density_data
 
 
-# --- Endpoint for Specific Location (less common, maybe for debugging/details) ---
+# --- Endpoint for Specific Location ---
 @app.get(
     f"{API_PREFIX}/air_quality/location",
     response_model=Optional[AirQualityReading], # Response can be None
-    summary="Get Latest Data for Specific Location",
-    description="Retrieves the absolute latest air quality reading stored for an exact latitude/longitude coordinate pair within the last hour."
-    )
+    summary="Get Latest Data for a Geohash Cell",
+    description="Retrieves the absolute latest air quality reading stored within a specific geohash cell, determined by the input latitude, longitude, and desired precision. Useful for getting data 'near' a point without needing exact coordinates."
+)
 async def get_air_quality_for_location(
-    lat: float = Query(..., ge=-90, le=90, description="Latitude of the location"),
-    lon: float = Query(..., ge=-180, le=180, description="Longitude of the location")
+    lat: float = Query(..., ge=-90, le=90, description="Latitude to determine the geohash cell."),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude to determine the geohash cell."),
+    # Default precision to storage precision, allow range (e.g., 4 to 9)
+    # Precision 5 as requested max, but allow flexibility. Defaulting to storage precision (e.g., 7)
+    # often makes sense to find *any* data in the finest stored grid first.
+    geohash_precision: int = Query(
+        settings.geohash_precision_storage, # Default to storage precision
+        ge=2, # Minimum reasonable precision for this use case
+        le=6, # Maximum standard geohash precision
+        description=f"Geohash precision level to search within (1=large cell, 9=small cell). Determines the size of the grid cell. Defaults to storage precision ({settings.geohash_precision_storage})."
+    ),
+    window: str = Query("1h", description="Time window to look back for the latest data (e.g., '1h', '15m'). Format: InfluxDB duration literal.")
 ):
     """
-    Looks for the most recent data point matching the exact coordinates.
-    Returns null if no data is found within the default 1-hour window.
+    Calculates the geohash for the given lat/lon at the specified `geohash_precision`.
+    Looks for the most recent data point tagged with this exact geohash within the specified `window`.
+    Returns null if no data is found.
     """
-    logger.info(f"Request received for specific location: lat={lat}, lon={lon}")
-    # Call the database query function
-    data = query_latest_location_data(lat=lat, lon=lon, window="1h") # Uses default 1h window
+    logger.info(f"Request received for specific location: lat={lat}, lon={lon}, precision={geohash_precision}, window={window}")
+
+    # Call the updated database query function
+    data = query_latest_location_data(
+        lat=lat,
+        lon=lon,
+        precision=geohash_precision, # Pass the requested precision
+        window=window
+    )
 
     if not data:
-         logger.warning(f"No data found for specific location {lat},{lon}. Returning null.")
+         logger.info(f"No data found for location {lat},{lon} at precision {geohash_precision} within window {window}. Returning null.")
          return None
 
-    logger.info(f"Returning latest data for specific location {lat},{lon}.")
-    # The query function now returns the Pydantic model directly or None
+    logger.info(f"Returning latest data found within geohash cell for location {lat},{lon} (precision {geohash_precision}).")
+    # The query function returns the Pydantic model directly or None
     return data
 
 # --- POST Endpoint for Ingesting Data ---

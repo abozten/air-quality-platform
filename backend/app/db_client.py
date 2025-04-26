@@ -579,28 +579,47 @@ def write_air_quality_data(reading: AirQualityReading):
         return False
 
 # --- Example Query Function ---
-def query_latest_location_data(lat: float, lon: float, window: str = "1h") -> Optional[AirQualityReading]:
-    """Queries the latest data point for a specific location within a window using coordinate tags."""
+def query_latest_location_data(
+    lat: float,
+    lon: float,
+    precision: int, # Precision for the geohash lookup
+    window: str = "1h" # Time window to look back
+) -> Optional[AirQualityReading]:
+    """
+    Queries the latest data point within a specific geohash cell, determined
+    by the given lat/lon and precision.
+    """
     if not query_api:
         logger.error("InfluxDB query_api not available.")
         return None
+    if not geohash:
+         logger.error("Geohash library not available. Cannot perform geohash-based query.")
+         return None
 
-    # Construct Flux query using exact coordinate tag matching
+    try:
+        # Calculate the target geohash for the given coordinates and precision
+        target_geohash = geohash.encode(lat, lon, precision=precision)
+        logger.info(f"Querying latest data for geohash '{target_geohash}' (precision {precision}) near ({lat},{lon}), window '{window}'")
+    except Exception as e:
+        logger.error(f"Failed to calculate geohash for ({lat},{lon}) with precision {precision}: {e}", exc_info=True)
+        return None
+
+    # Construct Flux query filtering by the calculated geohash tag
     flux_query = f'''
         from(bucket: "{influx_bucket}")
           |> range(start: -{window})
           |> filter(fn: (r) => r["_measurement"] == "air_quality")
-          |> filter(fn: (r) => r["latitude"] == "{lat}") // Exact match on string tags
-          |> filter(fn: (r) => r["longitude"] == "{lon}")
-          |> last() // Get the most recent point for each field matching criteria
-          |> pivot(rowKey:["_time", "latitude", "longitude"], columnKey: ["_field"], valueColumn: "_value") // Reshape fields into columns
+          |> filter(fn: (r) => r["geohash"] == "{target_geohash}") // Filter by the specific geohash tag
+          |> last() // Get the most recent point for each field within this geohash cell
+          |> pivot(rowKey:["_time", "geohash", "latitude", "longitude"], columnKey: ["_field"], valueColumn: "_value") // Reshape fields into columns, keep original tags
     '''
-    logger.debug(f"Executing Flux query for specific location:\n{flux_query}")
+    logger.debug(f"Executing Flux query for specific geohash cell:\n{flux_query}")
+
     try:
         tables = query_api.query(query=flux_query, org=influx_org)
 
         if not tables or not tables[0].records:
-             logger.info(f"No data found for lat={lat}, lon={lon} in the last {window}")
+             logger.info(f"No data found for geohash '{target_geohash}' (precision {precision}) near {lat},{lon} in the last {window}")
              return None
 
         # Process the result (pivot makes this easier)
@@ -609,10 +628,13 @@ def query_latest_location_data(lat: float, lon: float, window: str = "1h") -> Op
 
         # Convert the dictionary result back to Pydantic model
         try:
-            # Use get with defaults or handle potential missing keys/type errors
+            # Use the lat/lon stored with the point (which might differ slightly from input)
+            stored_lat = float(data.get('latitude', lat)) # Fallback to input lat if tag missing (shouldn't happen)
+            stored_lon = float(data.get('longitude', lon))
+
             reading = AirQualityReading(
-                latitude=float(data.get('latitude', lat)), # Use tag value or input as fallback
-                longitude=float(data.get('longitude', lon)),
+                latitude=stored_lat,
+                longitude=stored_lon,
                 timestamp=record.get_time(), # Get timestamp from record metadata
                 pm25=data.get('pm25'),
                 pm10=data.get('pm10'),
@@ -621,17 +643,17 @@ def query_latest_location_data(lat: float, lon: float, window: str = "1h") -> Op
                 o3=data.get('o3')
                 # Add other fields as needed
             )
-            logger.debug(f"Query result for {lat},{lon}: {reading}")
+            logger.debug(f"Query result for geohash {target_geohash}: {reading}")
             return reading
         except (ValueError, TypeError, KeyError) as e:
-            logger.error(f"Error converting query result for {lat},{lon} to Pydantic model: {e}. Data: {data}", exc_info=True)
+            logger.error(f"Error converting query result for geohash {target_geohash} to Pydantic model: {e}. Data: {data}", exc_info=False)
             return None # Indicate failure to parse the record
 
     except InfluxDBError as e:
-        logger.error(f"InfluxDB Error querying specific location data: {e}", exc_info=True)
+        logger.error(f"InfluxDB Error querying specific geohash cell data ({target_geohash}): {e}", exc_info=True)
         return None
     except Exception as e:
-        logger.error(f"Generic error querying specific location data: {e}", exc_info=True)
+        logger.error(f"Generic error querying specific geohash cell data ({target_geohash}): {e}", exc_info=True)
         return None
 
 # --- Close Client ---
