@@ -1,20 +1,21 @@
 // frontend/src/App.jsx
 import React, { useState, useEffect } from 'react';
-import MapComponent from './components/MapComponent';
-import AnomalyPanel from './components/AnomalyPanel';
-import PollutionChart from './components/PollutionChart';
-import * as api from './services/api';
 import './App.css';
+import MapComponent from './components/MapComponent';
+import PollutionChart from './components/PollutionChart';
+import AnomalyPanel from './components/AnomalyPanel';
+import * as api from './services/api';
 
 function App() {
   const [mapPoints, setMapPoints] = useState([]);
   const [anomalies, setAnomalies] = useState([]);
-  const [pollutionData, setPollutionData] = useState({});
-  const [selectedParam, setSelectedParam] = useState('pm25');
+  const [selectedLocationData, setSelectedLocationData] = useState(null);
+  const [selectedParam, setSelectedParam] = useState('pm25'); // Default to PM2.5
   const [isLoadingPoints, setIsLoadingPoints] = useState(false);
   const [isLoadingAnomalies, setIsLoadingAnomalies] = useState(false);
   const [errorPoints, setErrorPoints] = useState(null);
   const [errorAnomalies, setErrorAnomalies] = useState(null);
+  const [currentZoom, setCurrentZoom] = useState(2); // Track the current zoom level
 
   // Fetch initial map points and anomalies on component mount
   useEffect(() => {
@@ -23,7 +24,7 @@ function App() {
       setIsLoadingPoints(true);
       setErrorPoints(null);
       try {
-        const pointsData = await api.fetchAirQualityPoints(200);
+        const pointsData = await api.fetchAirQualityPoints(200, currentZoom); // Pass zoom level
         setMapPoints(pointsData);
       } catch (err) {
         console.error("Failed to fetch map points:", err);
@@ -36,6 +37,7 @@ function App() {
       setIsLoadingAnomalies(true);
       setErrorAnomalies(null);
       try {
+         // Fetch anomalies for the last 24 hours (default in API)
         const anomalyData = await api.fetchAnomalies();
         setAnomalies(anomalyData);
       } catch (err) {
@@ -47,48 +49,47 @@ function App() {
     };
 
     loadInitialData();
-    
-    // Auto-refresh data every 5 minutes
-    const refreshInterval = setInterval(() => {
-      loadInitialData();
-    }, 5 * 60 * 1000);
-    
-    return () => clearInterval(refreshInterval);
-  }, []);
+  }, [currentZoom]); // Re-fetch when zoom level changes
 
-  // Handle parameter change for the heatmap
+  // Function to handle clicks on map markers
+  const handleMarkerClick = async (point) => {
+    console.log("Marker clicked:", point);
+    // Optional: Fetch more detailed data for the clicked point if needed
+    // setSelectedLocationData(point); // Simple display of clicked data
+    // Or make a new API call:
+    // const detailedData = await api.fetchAirQualityForLocation(point.latitude, point.longitude);
+    // setSelectedLocationData(detailedData);
+  };
+
   const handleParamChange = (event) => {
     setSelectedParam(event.target.value);
   };
 
+  // Function to handle clicks directly on the map (optional)
+  const handleMapClick = (latlng) => {
+    console.log("Map clicked at:", latlng);
+    // You could potentially fetch data for this clicked coordinate
+    // Or trigger adding a new manual data point entry form etc.
+  };
+
+  // Handle data updates from map component when zoom level changes
+  const handleMapDataUpdate = (newData) => {
+    setMapPoints(newData);
+  };
+
   return (
     <div className="App">
-      {/* Header & Navigation */}
       <header className="App-header">
-        <h1>AirMon</h1>
-        <div className="nav-links">
-          <a href="#" className="active">Home</a>
-          <a href="#">Detailed Analysis</a>
-          <a href="#">About</a>
-          <a href="#">API Docs</a>
-        </div>
+        <h1>World Air Quality Monitor</h1>
       </header>
 
-      {/* Main Content */}
       <div className="main-content">
-        {/* Hero Section */}
-        <section className="hero-section">
-          <h2>Air Monitoring Platform</h2>
-          <p>A web-based platform for collecting, analyzing, and visualizing air pollution data worldwide.</p>
-        </section>
+        <div className="map-container-wrapper">
 
-        {/* Map Section */}
-        <div className="map-container">
-          {isLoadingPoints && <div className="loading-overlay">Loading map data...</div>}
-          {errorPoints && <div className="error-message">Error loading map data: {errorPoints}</div>}
-          
-          <div className="map-controls">
-            <label htmlFor="param-select">Display Parameter: </label>
+          {/* **************************************** */}
+          {/* Parameter Selection Dropdown */}
+          <div className="parameter-selector">
+            <label htmlFor="param-select">Heatmap Parameter: </label>
             <select id="param-select" value={selectedParam} onChange={handleParamChange}>
               <option value="pm25">PM2.5</option>
               <option value="pm10">PM10</option>
@@ -97,24 +98,34 @@ function App() {
               <option value="o3">O₃</option>
             </select>
           </div>
-          
-          <MapComponent 
-            points={mapPoints} 
-            anomalies={anomalies} 
+          {/* **************************************** */}
+
+          <h2>Air Quality Heatmap ({selectedParam.toUpperCase()})</h2> {/* Dynamic Title */}
+          {isLoadingPoints && <p>Loading map data...</p>}
+          {errorPoints && <p style={{ color: 'red' }}>Error loading map data: {errorPoints}</p>}
+
+          {/* **************************************** */}
+          {/* Pass onDataUpdate callback to MapComponent */}
+          <MapComponent
+            points={mapPoints}
             selectedParam={selectedParam}
+            anomalies={anomalies}
+            onDataUpdate={handleMapDataUpdate}
           />
+          {/* **************************************** */}
+
         </div>
 
-        {/* Panels Section */}
-        <div className="panels-section">
-          {/* Air Pollution Level Charts */}
-          <PollutionChart pollutionData={pollutionData} />
-          
-          {/* Anomaly Panel */}
-          <AnomalyPanel 
+        <div className="sidebar">
+          <AnomalyPanel
             anomalies={anomalies}
             isLoading={isLoadingAnomalies}
             error={errorAnomalies}
+            onSelectAnomaly={(anomaly) => setSelectedLocationData(anomaly)}
+          />
+          <PollutionChart
+            location={selectedLocationData}
+            selectedParam={selectedParam}
           />
         </div>
       </div>

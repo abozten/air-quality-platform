@@ -10,19 +10,49 @@ const handleResponse = async (response) => {
   return response.json();
 };
 
+/**
+ * Convert map zoom level to appropriate geohash precision
+ * Zoom levels:
+ * 0-3: world/continent view (precision 2)
+ * 4-6: country view (precision 3)
+ * 7-10: region/city view (precision 4)
+ * 11-14: neighborhood view (precision 5)
+ * 15+: street level view (precision 6)
+ */
+export const zoomToGeohashPrecision = (zoom) => {
+  if (zoom === undefined) return 3; // Default
+  
+  if (zoom <= 3) return 2;
+  if (zoom <= 6) return 3;
+  if (zoom <= 10) return 4;
+  if (zoom <= 14) return 5;
+  return 6;
+};
+
 // Fetch aggregated air quality points for the map visualization
-export const fetchAirQualityPoints = async (limit = 200, precision = 6) => {
+export const fetchAirQualityPoints = async (limit = 200, zoom = 2) => {
+  const precision = zoomToGeohashPrecision(zoom);
   const response = await fetch(`${API_BASE_URL}/air_quality/points?limit=${limit}&geohash_precision=${precision}`);
   return handleResponse(response);
 };
 
-// Fetch specific location data (when clicking on a point)
-export const fetchAirQualityForLocation = async (lat, lon) => {
+// Fetch specific location data (when clicking on a point) also used for the chart.
+export const fetchAirQualityForLocation = async (lat, lon, zoom = 10, window = '1h') => {
   if (lat === undefined || lon === undefined) {
     console.error("Latitude or Longitude is undefined");
     return null;
   }
-  const response = await fetch(`${API_BASE_URL}/air_quality/location?lat=${lat}&lon=${lon}`);
+  
+  const geohashPrecision = zoomToGeohashPrecision(zoom);
+  
+  const params = new URLSearchParams({
+    lat: lat,
+    lon: lon,
+    geohash_precision: geohashPrecision,
+    window: window
+  });
+  
+  const response = await fetch(`${API_BASE_URL}/air_quality/location?${params.toString()}`);
   return handleResponse(response);
 };
 
@@ -55,15 +85,3 @@ export const fetchPollutionDensity = async (minLat, maxLat, minLon, maxLon, wind
   return handleResponse(response);
 };
 
-// Optional: Function to ingest new data points (for testing/demo purposes)
-export const ingestAirQualityData = async (data) => {
-  const response = await fetch(`${API_BASE_URL}/air_quality/ingest`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(data)
-  });
-  
-  return handleResponse(response);
-};
