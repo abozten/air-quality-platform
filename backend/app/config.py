@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     rabbitmq_pass: str = Field("guest", alias="RABBITMQ_DEFAULT_PASS")
     rabbitmq_queue_raw: str = "raw_air_quality"
     
-    geohash_precision_storage: int = 7 # Example precision
+    geohash_precision_storage: int = 5
 
     # Anomaly Detection Thresholds (Keep as is)
     threshold_pm25_hazardous: float = 250.0
