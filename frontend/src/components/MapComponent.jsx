@@ -4,6 +4,9 @@ import { MapContainer, TileLayer, useMap, Marker, Tooltip, ZoomControl, useMapEv
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import 'leaflet.heat';
+import MarkerClusterGroup from 'react-leaflet-markercluster'; // Import MarkerClusterGroup
+import 'leaflet.markercluster/dist/MarkerCluster.css'; // Import MarkerCluster CSS
+import 'leaflet.markercluster/dist/MarkerCluster.Default.css'; // Import MarkerCluster Default CSS
 import * as api from '../services/api';
 import HeatmapLayer from './HeatmapLayer';
 
@@ -24,16 +27,19 @@ const alertIcon = L.divIcon({
   iconAnchor: [12, 24],
 });
 
-// Component to display anomaly markers
+// Component to display anomaly markers within a cluster group
 const AnomalyMarkers = ({ anomalies }) => {
   if (!anomalies || anomalies.length === 0) return null;
-  
+
   return (
-    <>
+    <MarkerClusterGroup
+      // Options for MarkerClusterGroup can be added here if needed
+      // e.g., maxClusterRadius={50} // Adjust clustering radius (pixels)
+    >
       {anomalies.map(anomaly => (
-        <Marker 
-          key={anomaly.id} 
-          position={[anomaly.latitude, anomaly.longitude]} 
+        <Marker
+          key={anomaly.id}
+          position={[anomaly.latitude, anomaly.longitude]}
           icon={alertIcon}
         >
           <Tooltip permanent={false} direction="top">
@@ -45,7 +51,7 @@ const AnomalyMarkers = ({ anomalies }) => {
           </Tooltip>
         </Marker>
       ))}
-    </>
+    </MarkerClusterGroup>
   );
 };
 
