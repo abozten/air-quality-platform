@@ -59,7 +59,7 @@ origins = [
     "http://127.0.0.1:5173",
     # Add WebSocket origins
     "ws://localhost:3000",
-    "ws://localhost:5173",
+    "ws://localhost:5173", # Add this line for Vite WebSocket
     "ws://127.0.0.1:5173",
     # Add production frontend origin here if applicable
 ]
@@ -267,33 +267,61 @@ async def ingest_air_quality_data(
 async def websocket_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint for clients to connect and receive live anomaly notifications.
+    Sends recent anomalies upon connection.
     """
     connection_id = await websocket_manager.manager.connect(websocket)
     logger.info(f"WebSocket client {connection_id} connected. Current connections: {len(websocket_manager.manager.active_connections)}")
-    
-    # Send a welcome message to confirm connection is working
+
+    # Send a welcome message
     try:
         await websocket.send_json({
-            "type": "connection_status", 
-            "message": "Connected to anomaly notification service", 
+            "type": "connection_status",
+            "message": "Connected to anomaly notification service",
             "status": "connected",
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"Sent welcome message to client {connection_id}")
+
+        # --- Send recent anomalies ---
+        try:
+            # Query recent anomalies (e.g., last 10)
+            recent_anomalies = query_anomalies_from_db(limit=10) # Adjust limit as needed
+            logger.info(f"Fetched {len(recent_anomalies)} recent anomalies for client {connection_id}")
+
+            if recent_anomalies:
+                # Send each recent anomaly individually
+                for anomaly in recent_anomalies:
+                    try:
+                        await websocket.send_json({
+                            "type": "recent_anomaly", # Distinguish from live broadcast
+                            "payload": anomaly.model_dump(mode='json')
+                        })
+                    except Exception as send_err:
+                        logger.error(f"Failed to send recent anomaly {anomaly.id} to client {connection_id}: {send_err}")
+
+                logger.info(f"Finished sending {len(recent_anomalies)} recent anomalies to client {connection_id}")
+            else:
+                logger.info(f"No recent anomalies found to send to client {connection_id}")
+
+        except Exception as db_err:
+            logger.error(f"Failed to query recent anomalies for client {connection_id}: {db_err}")
+
     except Exception as e:
-        logger.error(f"Failed to send welcome message to client {connection_id}: {e}")
-    
+        logger.error(f"Error during initial connection or sending recent anomalies for client {connection_id}: {e}")
+        websocket_manager.manager.disconnect(connection_id)
+        return
+
     try:
         while True:
             # Keep the connection alive and handle incoming messages
             data = await websocket.receive_text()
             logger.debug(f"Received message from client {connection_id}: {data}")
-            
+
             # Handle ping messages
             if data == "ping":
                 await websocket.send_json({
-                    "type": "pong", 
-                    "message": "Server received ping", 
+                    "type": "pong",
+                    "message": "Server received ping",
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
                 logger.debug(f"Sent pong response to client {connection_id}")

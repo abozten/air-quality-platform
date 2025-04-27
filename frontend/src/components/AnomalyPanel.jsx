@@ -56,32 +56,45 @@ const AnomalyPanel = ({ anomalies = [], isLoading, error }) => {
         };
         
         ws.onmessage = (event) => {
-          console.log('DEBUG: Received WebSocket message:', event.data);
+          // Log raw data first
+          console.log('DEBUG: Raw WebSocket message received:', event.data); 
           setMessageCount(prev => prev + 1);
           
           try {
+            // Check if data is a string before parsing
+            if (typeof event.data !== 'string') {
+              console.warn('DEBUG: Received non-string WebSocket message:', event.data);
+              return; // Skip processing if not a string
+            }
+
             // Parse the incoming message
             const data = JSON.parse(event.data);
             console.log('DEBUG: Parsed WebSocket data:', data);
             
-            // Handle connection status messages
-            if (data.type === 'connection_status' || data.type === 'pong') {
-              console.log('DEBUG: Received status message:', data.type);
+            // Handle connection status messages or pings/pongs
+            if (data.type === 'connection_status' || data.type === 'pong' || event.data === 'pong') { // Also check raw data for simple 'pong'
+              console.log('DEBUG: Received status/pong message:', data.type || event.data);
               return;
             }
             
             // Process anomaly data - log all properties to help debugging
             console.log('DEBUG: Anomaly properties:', Object.keys(data));
+
+            // Ensure the anomaly has an ID before proceeding
+            if (!data.id) {
+              console.warn('DEBUG: Received anomaly without an ID, skipping:', data);
+              return;
+            }
             
             // Add the anomaly to our state
             setAllAnomalies(prev => {
               // Skip if this anomaly already exists
               if (prev.some(a => a.id === data.id)) {
-                console.log('DEBUG: Duplicate anomaly detected, skipping');
+                console.log(`DEBUG: Duplicate anomaly detected (ID: ${data.id}), skipping`);
                 return prev;
               }
               
-              console.log('DEBUG: Adding new anomaly to list:', data.id);
+              console.log(`DEBUG: Adding new anomaly to list (ID: ${data.id})`);
               // Add to beginning of array
               return [data, ...prev];
             });
@@ -97,7 +110,9 @@ const AnomalyPanel = ({ anomalies = [], isLoading, error }) => {
               setHasNewAnomalies(false);
             }, 5000);
           } catch (e) {
+            // Log the error and the raw data that caused it
             console.error('DEBUG: Error processing WebSocket message:', e);
+            console.error('DEBUG: Raw data causing error:', event.data); 
           }
         };
         
