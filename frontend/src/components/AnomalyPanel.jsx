@@ -18,7 +18,9 @@ const AnomalyPanel = ({ anomalies = [], isLoading, error }) => {
   
   // Update allAnomalies when the prop changes (initial load)
   useEffect(() => {
-    setAllAnomalies(anomalies);
+    // Sort anomalies by timestamp (descending) before setting state
+    const sortedAnomalies = [...anomalies].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    setAllAnomalies(sortedAnomalies);
   }, [anomalies]);
   
   // Set up WebSocket connection for real-time anomalies
@@ -86,7 +88,7 @@ const AnomalyPanel = ({ anomalies = [], isLoading, error }) => {
               return;
             }
             
-            // Add the anomaly to our state
+            // Add the anomaly to our state and re-sort
             setAllAnomalies(prev => {
               // Skip if this anomaly already exists
               if (prev.some(a => a.id === data.id)) {
@@ -94,9 +96,11 @@ const AnomalyPanel = ({ anomalies = [], isLoading, error }) => {
                 return prev;
               }
               
-              console.log(`DEBUG: Adding new anomaly to list (ID: ${data.id})`);
-              // Add to beginning of array
-              return [data, ...prev];
+              console.log(`DEBUG: Adding new anomaly (ID: ${data.id}) and re-sorting`);
+              // Add new anomaly and sort the entire list by timestamp (descending)
+              const updatedAnomalies = [data, ...prev];
+              updatedAnomalies.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+              return updatedAnomalies;
             });
             
             // Set flag to highlight the new anomaly
@@ -185,10 +189,10 @@ const AnomalyPanel = ({ anomalies = [], isLoading, error }) => {
       
       {!isLoading && !error && allAnomalies.length > 0 && (
         <ul className="anomaly-list">
-          {allAnomalies.map((anomaly, index) => (
+          {allAnomalies.map((anomaly) => (
             <li 
-              key={anomaly.id || index} 
-              className={`anomaly-item ${index === 0 && hasNewAnomalies ? 'new-anomaly' : ''}`}
+              key={anomaly.id} // Use anomaly.id as key
+              className={`anomaly-item ${hasNewAnomalies && (Date.now() - new Date(anomaly.timestamp).getTime()) < 5000 ? 'new-anomaly' : ''}`} 
             >
               <div className="anomaly-time">
                 {new Date(anomaly.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}

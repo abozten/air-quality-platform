@@ -15,11 +15,13 @@
     "chart.js": "^4.4.9",
     "leaflet": "^1.9.4",
     "leaflet.heat": "^0.2.0",
+    "leaflet.markercluster": "^1.5.3",
     "ngeohash": "^0.6.3",
     "react": "^19.0.0",
     "react-chartjs-2": "^5.3.0",
     "react-dom": "^19.0.0",
-    "react-leaflet": "^5.0.0"
+    "react-leaflet": "^5.0.0",
+    "react-leaflet-markercluster": "^5.0.0-rc.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.22.0",
