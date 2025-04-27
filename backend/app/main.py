@@ -285,7 +285,7 @@ async def websocket_endpoint(websocket: WebSocket):
         # --- Send recent anomalies ---
         try:
             # Query recent anomalies (e.g., last 10)
-            recent_anomalies = query_anomalies_from_db(limit=10) # Adjust limit as needed
+            recent_anomalies = query_anomalies_from_db() 
             logger.info(f"Fetched {len(recent_anomalies)} recent anomalies for client {connection_id}")
 
             if recent_anomalies:
@@ -308,7 +308,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except Exception as e:
         logger.error(f"Error during initial connection or sending recent anomalies for client {connection_id}: {e}")
-        websocket_manager.manager.disconnect(connection_id)
+        await websocket_manager.manager.disconnect(connection_id)
         return
 
     try:
@@ -327,10 +327,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.debug(f"Sent pong response to client {connection_id}")
     except WebSocketDisconnect:
         logger.info(f"WebSocket client {connection_id} disconnected")
-        websocket_manager.manager.disconnect(connection_id)
+        await websocket_manager.manager.disconnect(connection_id)
     except Exception as e:
         logger.error(f"WebSocket error with client {connection_id}: {e}")
-        websocket_manager.manager.disconnect(connection_id)
+        await websocket_manager.manager.disconnect(connection_id)
 
 # --- Test Endpoint for WebSocket Anomaly Broadcast ---
 @app.post(

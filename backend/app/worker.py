@@ -106,13 +106,13 @@ async def process_message(message: aio_pika.IncomingMessage):
                     # Log error but don't fail the original message processing just for this
                     logger.error(f"WORKER: Failed write for detected anomaly {anomaly.id} (non-blocking).")
                 else:
-                     logger.debug("WORKER: Non-blocking anomaly write successful.")
+                    logger.debug("WORKER: Non-blocking anomaly write successful.")
 
                 # 4.4. Broadcast anomaly via WebSocket
                 logger.debug("WORKER: Broadcasting anomaly via WebSocket...")
                 try:
                     await websocket_manager.broadcast_anomaly(anomaly)
-                    logger.debug("WORKER: Anomaly broadcast successful.")
+                    logger.info("WORKER: Anomaly broadcast successful.")
                 except Exception as ws_error:
                     logger.error(f"WORKER: Failed to broadcast anomaly {anomaly.id} via WebSocket. Error: {ws_error}", exc_info=True)
             else:

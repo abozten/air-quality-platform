@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from .models import Anomaly, PollutionDensity
 import json # Needed for query formatting
+from math import radians, cos, sin, sqrt, atan2
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -582,19 +583,20 @@ def write_air_quality_data(reading: AirQualityReading):
 def query_latest_location_data(
     lat: float,
     lon: float,
-    precision: int, # Precision for the geohash lookup
-    window: str = "1h" # Time window to look back
+    precision: int,  # Precision for the geohash lookup
+    window: str = "1h"  # Time window to look back
 ) -> Optional[AirQualityReading]:
     """
     Queries the latest data point within a specific geohash cell, determined
-    by the given lat/lon and precision.
+    by the given lat/lon and precision. If no data is found, estimate by
+    expanding the search to a 50 km radius and averaging available points.
     """
     if not query_api:
         logger.error("InfluxDB query_api not available.")
         return None
     if not geohash:
-         logger.error("Geohash library not available. Cannot perform geohash-based query.")
-         return None
+        logger.error("Geohash library not available. Cannot perform geohash-based query.")
+        return None
 
     try:
         # Calculate the target geohash for the given coordinates and precision
@@ -618,36 +620,120 @@ def query_latest_location_data(
     try:
         tables = query_api.query(query=flux_query, org=influx_org)
 
-        if not tables or not tables[0].records:
-             logger.info(f"No data found for geohash '{target_geohash}' (precision {precision}) near {lat},{lon} in the last {window}")
-             return None
+        if tables and tables[0].records:
+            # Process the result (pivot makes this easier)
+            record = tables[0].records[0]  # Get the first (and only) record after pivot
+            data = record.values  # Dictionary of fields and tags included in pivot rowKey
 
-        # Process the result (pivot makes this easier)
-        record = tables[0].records[0] # Get the first (and only) record after pivot
-        data = record.values # Dictionary of fields and tags included in pivot rowKey
+            # Convert the dictionary result back to Pydantic model
+            try:
+                stored_lat = float(data.get('latitude', lat))
+                stored_lon = float(data.get('longitude', lon))
 
-        # Convert the dictionary result back to Pydantic model
-        try:
-            # Use the lat/lon stored with the point (which might differ slightly from input)
-            stored_lat = float(data.get('latitude', lat)) # Fallback to input lat if tag missing (shouldn't happen)
-            stored_lon = float(data.get('longitude', lon))
+                reading = AirQualityReading(
+                    latitude=stored_lat,
+                    longitude=stored_lon,
+                    timestamp=record.get_time(),
+                    pm25=data.get('pm25'),
+                    pm10=data.get('pm10'),
+                    no2=data.get('no2'),
+                    so2=data.get('so2'),
+                    o3=data.get('o3')
+                )
+                logger.debug(f"Query result for geohash {target_geohash}: {reading}")
+                return reading
+            except (ValueError, TypeError, KeyError) as e:
+                logger.error(f"Error converting query result for geohash {target_geohash} to Pydantic model: {e}. Data: {data}", exc_info=False)
+                return None
 
-            reading = AirQualityReading(
-                latitude=stored_lat,
-                longitude=stored_lon,
-                timestamp=record.get_time(), # Get timestamp from record metadata
-                pm25=data.get('pm25'),
-                pm10=data.get('pm10'),
-                no2=data.get('no2'),
-                so2=data.get('so2'),
-                o3=data.get('o3')
-                # Add other fields as needed
-            )
-            logger.debug(f"Query result for geohash {target_geohash}: {reading}")
-            return reading
-        except (ValueError, TypeError, KeyError) as e:
-            logger.error(f"Error converting query result for geohash {target_geohash} to Pydantic model: {e}. Data: {data}", exc_info=False)
-            return None # Indicate failure to parse the record
+        # --- No data found: Estimate using 50 km radius ---
+        logger.info(f"No data found for geohash '{target_geohash}' (precision {precision}) near {lat},{lon} in the last {window}. Estimating using 50 km radius.")
+
+        # Approximate 50 km in degrees (1 deg lat ~ 111 km)
+        delta_deg = 50.0 / 111.0
+        min_lat = lat - delta_deg
+        max_lat = lat + delta_deg
+        min_lon = lon - delta_deg
+        max_lon = lon + delta_deg
+
+        # Query all points in the bounding box in the time window
+        flux_query_radius = f'''
+            from(bucket: "{influx_bucket}")
+              |> range(start: -{window})
+              |> filter(fn: (r) => r["_measurement"] == "air_quality")
+              |> filter(fn: (r) => exists r.latitude and exists r.longitude)
+              |> map(fn: (r) => ({{ r with latitude_float: float(v: r.latitude), longitude_float: float(v: r.longitude) }}))
+              |> filter(fn: (r) => r.latitude_float >= {min_lat} and r.latitude_float <= {max_lat} and r.longitude_float >= {min_lon} and r.longitude_float <= {max_lon})
+              |> sort(columns: ["_time"], desc: true)
+              |> pivot(rowKey:["_time", "latitude", "longitude"], columnKey: ["_field"], valueColumn: "_value")
+        '''
+        logger.debug(f"Executing Flux query for 50km radius estimate:\n{flux_query_radius}")
+
+        tables_radius = query_api.query(query=flux_query_radius, org=influx_org)
+        points = []
+        for table in tables_radius:
+            for record in table.records:
+                data = record.values
+                try:
+                    stored_lat = float(data.get('latitude', lat))
+                    stored_lon = float(data.get('longitude', lon))
+                    # Calculate distance to center (lat, lon)
+                    R = 6371.0  # Earth radius in km
+                    dlat = radians(stored_lat - lat)
+                    dlon = radians(stored_lon - lon)
+                    a = sin(dlat / 2) ** 2 + cos(radians(lat)) * cos(radians(stored_lat)) * sin(dlon / 2) ** 2
+                    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+                    distance = R * c
+                    if distance <= 50.0:
+                        points.append({
+                            "latitude": stored_lat,
+                            "longitude": stored_lon,
+                            "timestamp": record.get_time(),
+                            "pm25": data.get('pm25'),
+                            "pm10": data.get('pm10'),
+                            "no2": data.get('no2'),
+                            "so2": data.get('so2'),
+                            "o3": data.get('o3')
+                        })
+                except Exception as e:
+                    logger.debug(f"Skipping record in radius estimate: {e}")
+
+        if not points:
+            logger.info(f"No data found within 50 km radius of ({lat},{lon}) in the last {window}.")
+            return None
+
+        # Average the values for estimate
+        def safe_float(val):
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        def avg(values):
+            vals = [safe_float(v) for v in values if v is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        pm25_avg = avg([p["pm25"] for p in points])
+        pm10_avg = avg([p["pm10"] for p in points])
+        no2_avg = avg([p["no2"] for p in points])
+        so2_avg = avg([p["so2"] for p in points])
+        o3_avg = avg([p["o3"] for p in points])
+
+        # Use the most recent timestamp among the points
+        latest_ts = max((p["timestamp"] for p in points if p["timestamp"]), default=None)
+
+        estimate = AirQualityReading(
+            latitude=lat,
+            longitude=lon,
+            timestamp=latest_ts,
+            pm25=pm25_avg,
+            pm10=pm10_avg,
+            no2=no2_avg,
+            so2=so2_avg,
+            o3=o3_avg
+        )
+        logger.info(f"Estimated air quality at ({lat},{lon}) using {len(points)} points within 50 km radius.")
+        return estimate
 
     except InfluxDBError as e:
         logger.error(f"InfluxDB Error querying specific geohash cell data ({target_geohash}): {e}", exc_info=True)
@@ -655,8 +741,6 @@ def query_latest_location_data(
     except Exception as e:
         logger.error(f"Generic error querying specific geohash cell data ({target_geohash}): {e}", exc_info=True)
         return None
-
-# --- Close Client ---
 def close_influx_client():
     if client:
         logger.info("Closing InfluxDB client.")
