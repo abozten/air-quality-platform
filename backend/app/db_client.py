@@ -52,7 +52,7 @@ except Exception as e:
     query_api = None
 
 
-# --- Query Function for Multiple Points ---
+# --- Query Function for Multiple Points  (air_quality/points)---
 def query_recent_points(limit: int = 50, window: str = "1h") -> List[AirQualityReading]:
     """
     Queries the latest distinct air quality readings from different locations

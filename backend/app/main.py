@@ -4,7 +4,7 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 import logging
-from fastapi import FastAPI, Query, HTTPException, Body, status
+from fastapi import FastAPI, Query, HTTPException, Body, status, WebSocket, WebSocketDisconnect
 from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint
 from .db_client import (
     query_latest_location_data,
@@ -16,6 +16,7 @@ from .db_client import (
 )
 from . import db_client # Keep for close_influx_client call
 from . import queue_client
+from . import websocket_manager # Import WebSocket manager
 from .aggregation import aggregate_by_geohash # Import aggregation function
 from .config import get_settings # Import get_settings
 
@@ -56,6 +57,10 @@ origins = [
     "http://localhost:5173", # Example Vite default
     "localhost:5173",
     "http://127.0.0.1:5173",
+    # Add WebSocket origins
+    "ws://localhost:3000",
+    "ws://localhost:5173",
+    "ws://127.0.0.1:5173",
     # Add production frontend origin here if applicable
 ]
 app.add_middleware(
@@ -200,7 +205,7 @@ async def get_air_quality_for_location(
         le=6, # Maximum standard geohash precision
         description=f"Geohash precision level to search within (1=large cell, 9=small cell). Determines the size of the grid cell. Defaults to storage precision ({settings.geohash_precision_storage})."
     ),
-    window: str = Query("1h", description="Time window to look back for the latest data (e.g., '1h', '15m'). Format: InfluxDB duration literal.")
+    window: str = Query("24h", description="Time window to look back for the latest data (e.g., '1h', '15m'). Format: InfluxDB duration literal.")
 ):
     """
     Calculates the geohash for the given lat/lon at the specified `geohash_precision`.
@@ -256,6 +261,82 @@ async def ingest_air_quality_data(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Failed to queue data for processing. The queue service may be temporarily unavailable or overloaded."
         )
+
+# --- WebSocket Endpoint for Live Anomaly Notifications ---
+@app.websocket(f"{API_PREFIX}/ws/anomalies")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for clients to connect and receive live anomaly notifications.
+    """
+    connection_id = await websocket_manager.manager.connect(websocket)
+    logger.info(f"WebSocket client {connection_id} connected. Current connections: {len(websocket_manager.manager.active_connections)}")
+    
+    # Send a welcome message to confirm connection is working
+    try:
+        await websocket.send_json({
+            "type": "connection_status", 
+            "message": "Connected to anomaly notification service", 
+            "status": "connected",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        logger.info(f"Sent welcome message to client {connection_id}")
+    except Exception as e:
+        logger.error(f"Failed to send welcome message to client {connection_id}: {e}")
+    
+    try:
+        while True:
+            # Keep the connection alive and handle incoming messages
+            data = await websocket.receive_text()
+            logger.debug(f"Received message from client {connection_id}: {data}")
+            
+            # Handle ping messages
+            if data == "ping":
+                await websocket.send_json({
+                    "type": "pong", 
+                    "message": "Server received ping", 
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                logger.debug(f"Sent pong response to client {connection_id}")
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client {connection_id} disconnected")
+        websocket_manager.manager.disconnect(connection_id)
+    except Exception as e:
+        logger.error(f"WebSocket error with client {connection_id}: {e}")
+        websocket_manager.manager.disconnect(connection_id)
+
+# --- Test Endpoint for WebSocket Anomaly Broadcast ---
+@app.post(
+    f"{API_PREFIX}/test/broadcast-anomaly",
+    summary="Test Anomaly Broadcast",
+    description="Creates a test anomaly and broadcasts it via WebSockets for testing purposes."
+)
+async def test_anomaly_broadcast():
+    """
+    Creates a test anomaly and broadcasts it to all connected WebSocket clients.
+    This is useful for debugging the WebSocket broadcast functionality.
+    """
+    logger.info("Creating and broadcasting test anomaly")
+    
+    # Create a test anomaly
+    import uuid
+    test_anomaly = Anomaly(
+        id=f"test_anomaly_{uuid.uuid4()}",
+        latitude=36.88,
+        longitude=30.70,
+        timestamp=datetime.now(timezone.utc),
+        parameter="pm25",
+        value=180.5,
+        description="TEST ANOMALY - High PM2.5 level detected in Antalya"
+    )
+    
+    # Broadcast the test anomaly
+    try:
+        await websocket_manager.broadcast_anomaly(test_anomaly)
+        logger.info(f"Test anomaly broadcast successful")
+        return {"message": "Test anomaly broadcast successful", "anomaly_id": test_anomaly.id}
+    except Exception as e:
+        logger.error(f"Failed to broadcast test anomaly: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to broadcast test anomaly: {str(e)}")
 
 # --- Basic Root Endpoint ---
 @app.get("/", summary="Root Endpoint", description="Basic API information.")

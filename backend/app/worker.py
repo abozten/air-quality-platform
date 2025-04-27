@@ -17,6 +17,7 @@ try:
     from .models import AirQualityReading, IngestRequest, Anomaly
     from . import db_client # Keep sync DB client for now
     from . import anomaly_detection # Keep sync anomaly detection
+    from . import websocket_manager # Import WebSocket manager for broadcasting anomalies
 except ImportError as e:
      logger.error(f"Failed to import necessary modules. Ensure structure is correct. Error: {e}")
      sys.exit(1)
@@ -106,6 +107,14 @@ async def process_message(message: aio_pika.IncomingMessage):
                     logger.error(f"WORKER: Failed write for detected anomaly {anomaly.id} (non-blocking).")
                 else:
                      logger.debug("WORKER: Non-blocking anomaly write successful.")
+
+                # 4.4. Broadcast anomaly via WebSocket
+                logger.debug("WORKER: Broadcasting anomaly via WebSocket...")
+                try:
+                    await websocket_manager.broadcast_anomaly(anomaly)
+                    logger.debug("WORKER: Anomaly broadcast successful.")
+                except Exception as ws_error:
+                    logger.error(f"WORKER: Failed to broadcast anomaly {anomaly.id} via WebSocket. Error: {ws_error}", exc_info=True)
             else:
                 logger.debug("WORKER: No threshold anomalies detected (non-blocking check).")
 
@@ -194,19 +203,26 @@ async def main():
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
     loop.add_signal_handler(signal.SIGTERM, stop_event.set)
 
+    # Create a task for the stop event wait coroutine
+    stop_wait_task = asyncio.create_task(stop_event.wait())
+
     # Wait for either the consumer task to finish naturally (unlikely)
     # or for the shutdown signal to be received
     done, pending = await asyncio.wait(
-        [consumer_task, stop_event.wait()],
+        [consumer_task, stop_wait_task], # Pass tasks, not coroutines
         return_when=asyncio.FIRST_COMPLETED
     )
 
     # If the stop event finished first, cancel the consumer task
-    if stop_event.is_set():
+    if stop_wait_task in done: # Check if the stop task completed
         logger.info("WORKER: Main loop received shutdown signal, cancelling consumer task...")
         consumer_task.cancel()
         # Wait for the consumer task to actually cancel
         await asyncio.gather(consumer_task, return_exceptions=True)
+    # Clean up the stop_wait_task if it's still pending (consumer_task finished first)
+    elif stop_wait_task in pending:
+        stop_wait_task.cancel()
+        await asyncio.gather(stop_wait_task, return_exceptions=True)
 
 if __name__ == "__main__":
     logger.info("Starting Async Air Quality Worker...")
