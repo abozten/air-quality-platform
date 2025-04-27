@@ -122,30 +122,40 @@ const HeatmapLayer = ({ points, selectedParam }) => {
 
       /* --- split into “real” data & “no-data placeholders” ---------- */
       const heatPts    = [];
-      // No longer collect no-data points
       const maxInt     = getMaxIntensity(selectedParam);
 
       Object.values(cells).forEach(c => {
         if (c.cnt > 0) {
           const avg = c.tot / c.cnt;
-          const intensity = Math.min(1, c.cnt / 10) * avg;
+          // Use average directly for intensity, capped by maxInt
+          const intensity = Math.min(avg / maxInt, 1.0);
           heatPts.push([c.lat, c.lng, intensity]);
         }
-        // We no longer collect points for areas with no data
       });
 
       /* --- push data into the two layers ---------------------------- */
       heatLayerRef.current.setOptions({
-        radius: 20, blur: 15, maxZoom: 11, max: maxInt,
+        // Increase radius and blur significantly for a smoother, more spread-out look
+        radius: 60, 
+        blur: 50, 
+        maxZoom: 18, // Allow heatmap effect at higher zooms if desired
+        max: 1.0, // Intensity is now normalized between 0 and 1
+        // Adjusted gradient for a smoother transition and different color scheme
         gradient: {
-          0.3: '#2c3e50', 0.5: '#3498db', 0.7: '#2ecc71',
-          0.8: '#f1c40f', 1.0: '#e74c3c'
+          0.0: 'rgba(0, 119, 190, 0.2)',  // Lighter Blue, slightly transparent start
+          0.2: '#00a8a8', // Teal
+          0.4: '#60c060', // Green
+          0.6: '#f0e040', // Yellow
+          0.8: '#f08000', // Orange
+          1.0: '#e00000'  // Red
         }
       });
       heatLayerRef.current.setLatLngs(heatPts);
 
-      // Set noDataLayer to empty array to make it completely invisible
-      noDataLayerRef.current.setLatLngs([]);
+      // Ensure noDataLayer remains empty/invisible
+      if (noDataLayerRef.current) {
+        noDataLayerRef.current.setLatLngs([]);
+      }
     } catch (error) {
       console.error('Error updating heatmap layer:', error);
     }

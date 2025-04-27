@@ -1,5 +1,8 @@
 # backend/app/main.py
 from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
+import random
+import geohash
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
@@ -84,29 +87,62 @@ API_PREFIX = "/api/v1"
 async def get_aggregated_air_quality_points(
     limit: int = Query(100, gt=0, le=500, description="Maximum number of aggregated geohash grid cells to return."),
     window: str = Query("1h", description="Time window to look for the latest data point from each location (e.g., '1h', '24h', '15m'). Format: InfluxDB duration literal."),
-    geohash_precision: int = Query(6, ge=1, le=9, description="Geohash precision for spatial aggregation. Lower value = larger grid cells.") # Max precision limited for practical use
+    geohash_precision: int = Query(6, ge=1, le=9, description="Geohash precision for spatial aggregation. Lower value = larger grid cells.")
 ):
-    """
-    Fetches the latest reading from distinct locations within the specified time `window`,
-    then aggregates these points into geohash cells of the given `geohash_precision`.
-    Returns a list of aggregated points, limited by `limit`.
-    """
     logger.info(f"Request for aggregated points: limit={limit}, window={window}, geohash_precision={geohash_precision}")
-    # Fetch more raw points than the final limit to allow for good aggregation results
-    # Example: If limit=100, fetching 500 raw points might be reasonable. Adjust as needed.
-    raw_points_fetch_limit = limit * 5
-    logger.debug(f"Querying DB for up to {raw_points_fetch_limit} raw points...")
-    raw_readings = query_recent_points(limit=raw_points_fetch_limit, window=window)
+
+    # 1. Fetch raw points (assuming query_recent_points fetches many distinct points now)
+    # The 'limit' here is now just a hint, the actual number depends on distinct locations found.
+    raw_readings = query_recent_points(limit=limit * 20, window=window) # Fetch a large potential pool
 
     if not raw_readings:
         logger.info("No raw points found for aggregation.")
         return []
 
-    logger.debug(f"Aggregating {len(raw_readings)} raw points with precision {geohash_precision}...")
+    logger.info(f"Fetched {len(raw_readings)} raw distinct points initially.") # Log count
+
+    # 2. Apply Geographic Sampling (if too many points and clustering suspected)
+    # We want roughly 'limit * N' points for good aggregation input. Let N=5.
+    desired_input_count = limit * 54
+    if len(raw_readings) > desired_input_count * 1.5: # Only sample if significantly more points than needed
+        logger.info(f"Applying geographic sampling: Have {len(raw_readings)}, need ~{desired_input_count} for aggregation input.")
+
+        # Use a coarse geohash for sampling (e.g., precision 2 or 3)
+        sampling_precision = 3
+        points_by_coarse_hash = defaultdict(list)
+        for reading in raw_readings:
+            try:
+                coarse_gh = geohash.encode(reading.latitude, reading.longitude, precision=sampling_precision)
+                points_by_coarse_hash[coarse_gh].append(reading)
+            except Exception:
+                continue # Skip points that can't be geohashed
+
+        selected_readings = []
+        # Prioritize taking at least one point from each coarse cell
+        cells = list(points_by_coarse_hash.keys())
+        random.shuffle(cells) # Process cells in random order
+
+        for gh in cells:
+            if points_by_coarse_hash[gh]:
+                 # Take the latest point from this cell (assuming already sorted or sort here)
+                 # points_by_coarse_hash[gh].sort(key=lambda r: r.timestamp, reverse=True) # Uncomment if query doesn't guarantee sort
+                 selected_readings.append(points_by_coarse_hash[gh][0])
+
+        # If still need more points, add more from the most populated cells (optional)
+        # Or simply use the selection from distinct cells if it's roughly enough
+
+        logger.info(f"Selected {len(selected_readings)} points after geographic sampling.")
+        input_for_aggregation = selected_readings[:desired_input_count] # Limit the input for aggregation
+    else:
+        # Not enough points to warrant complex sampling, use all fetched points
+        input_for_aggregation = raw_readings
+
+    # 3. Aggregate the (potentially sampled) points
+    logger.debug(f"Aggregating {len(input_for_aggregation)} points with precision {geohash_precision}...")
     aggregated = aggregate_by_geohash(
-        raw_readings,
+        input_for_aggregation, # Use the selected points
         precision=geohash_precision,
-        max_cells=limit # Apply the final limit after aggregation
+        max_cells=limit # Apply the final API limit
     )
     logger.info(f"Returning {len(aggregated)} aggregated points.")
     return aggregated
