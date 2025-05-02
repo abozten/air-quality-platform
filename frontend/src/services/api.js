@@ -31,7 +31,7 @@ export const zoomToGeohashPrecision = (zoom) => {
 };
 
 // Fetch aggregated air quality points for the map visualization
-export const fetchAirQualityPoints = async (limit = 200, zoom = 2) => {
+export const fetchAirQualityPoints = async (limit = 2000, zoom = 2) => {
   const precision = zoomToGeohashPrecision(zoom);
   const response = await fetch(`${API_BASE_URL}/air_quality/points?limit=${limit}&geohash_precision=${precision}`);
   return handleResponse(response);

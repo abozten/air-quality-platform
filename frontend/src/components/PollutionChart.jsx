@@ -1,76 +1,95 @@
 // frontend/src/components/PollutionChart.jsx
 import React from 'react';
+import './PollutionChart.css'; // We'll add some basic CSS
+
+// Define approximate max values for scaling bars (can be adjusted based on AQI levels)
+// Units are typically µg/m³
+const POLLUTANT_MAX_VALUES = {
+  pm25: 100, // Example max for PM2.5
+  no2: 80,   // Example max for NO2
+  o3: 120,   // Example max for O3
+};
+
+// Define colors (can be expanded for AQI levels)
+const POLLUTANT_COLORS = {
+  pm25: '#8a2be2', // Purple
+  no2: '#4CAF50',  // Green
+  o3: '#ffc107',   // Amber
+};
 
 const PollutionChart = ({ pollutionData }) => {
-  // Function to generate a random wave pattern for visualization
-  const generateRandomWave = (min, max) => {
-    const numPoints = 50;
-    const waveHeight = Math.random() * 20 + 10;
-    const waveFrequency = Math.random() * 0.5 + 0.2;
-    
-    let pathData = `M 0,${max/2}`;
-    
-    for (let i = 0; i < numPoints; i++) {
-      const x = (i / (numPoints - 1)) * 100;
-      const y = max/2 + Math.sin(i * waveFrequency) * waveHeight;
-      pathData += ` L ${x},${y}`;
+  // Helper function to render a single pollutant line with a bar
+  const renderPollutantLine = (pollutantKey, label, unit) => {
+    const value = pollutionData ? pollutionData[pollutantKey] : null;
+    const maxValue = POLLUTANT_MAX_VALUES[pollutantKey];
+    const color = POLLUTANT_COLORS[pollutantKey];
+
+    // Calculate bar width percentage, handle null/undefined/zero values
+    let barWidthPercent = 0;
+    if (value !== null && value !== undefined && maxValue > 0 && value > 0) {
+      barWidthPercent = Math.min((value / maxValue) * 100, 100); // Cap at 100%
     }
-    
-    return pathData;
+
+    const displayValue = (value !== null && value !== undefined)
+      ? value.toFixed(1) // Format to one decimal place
+      : 'N/A'; // Display 'N/A' if data is missing
+
+    return (
+      <div className="chart-line" key={pollutantKey}>
+        <div className="chart-label">{label}</div>
+        <div className="chart-visual">
+          <svg width="100%" height="20" viewBox="0 0 100 20" preserveAspectRatio="none">
+            {/* Background bar (optional) */}
+            <rect x="0" y="5" width="100%" height="10" fill="#e0e0e0" rx="3" ry="3" />
+            {/* Data bar */}
+            {barWidthPercent > 0 && (
+               <rect
+                 x="0"
+                 y="5"
+                 width={`${barWidthPercent}%`}
+                 height="10"
+                 fill={color}
+                 rx="3" // Rounded corners
+                 ry="3"
+               />
+            )}
+          </svg>
+        </div>
+        <div className="chart-value">
+          {displayValue} <span className="chart-unit">{unit}</span>
+        </div>
+      </div>
+    );
   };
-  
+
   return (
     <div className="air-pollution-panel">
       <div className="panel-header">
-        <h3>Air Pollution Levels</h3>
+        <h3>Air Quality Reading</h3>
+        {pollutionData?.timestamp && (
+          <span className="timestamp">
+            Last updated: {new Date(pollutionData.timestamp).toLocaleString()}
+          </span>
+        )}
+         {!pollutionData && (
+           <span className="timestamp">No data available for selected location.</span>
+         )}
       </div>
-      
+
       <div className="pollution-charts">
-        {/* PM2.5 Chart */}
-        <div className="chart-line">
-          <div className="chart-label">PM 2.5</div>
-          <div className="chart-visual">
-            <svg width="100%" height="30" viewBox="0 0 100 30">
-              <path 
-                d={generateRandomWave(5, 25)} 
-                stroke="#8a2be2" 
-                strokeWidth="2" 
-                fill="none" 
-              />
-            </svg>
-          </div>
-        </div>
-        
-        {/* NO2 Chart */}
-        <div className="chart-line">
-          <div className="chart-label">NO₂</div>
-          <div className="chart-visual">
-            <svg width="100%" height="30" viewBox="0 0 100 30">
-              <path 
-                d={generateRandomWave(5, 25)} 
-                stroke="#4CAF50" 
-                strokeWidth="2" 
-                fill="none" 
-              />
-            </svg>
-          </div>
-        </div>
-        
-        {/* O3 Chart */}
-        <div className="chart-line">
-          <div className="chart-label">O₃</div>
-          <div className="chart-visual">
-            <svg width="100%" height="30" viewBox="0 0 100 30">
-              <path 
-                d={generateRandomWave(5, 25)} 
-                stroke="#ffc107" 
-                strokeWidth="2" 
-                fill="none" 
-              />
-            </svg>
-          </div>
-        </div>
+        {renderPollutantLine('pm25', 'PM 2.5', 'µg/m³')}
+        {renderPollutantLine('no2', 'NO₂', 'µg/m³')}
+        {renderPollutantLine('o3', 'O₃', 'µg/m³')}
+        {/* Add other pollutants if needed and available in your data */}
+        {/* e.g., renderPollutantLine('pm10', 'PM 10', 'µg/m³') */}
+        {/* e.g., renderPollutantLine('co', 'CO', 'µg/m³') */}
+        {/* e.g., renderPollutantLine('so2', 'SO₂', 'µg/m³') */}
       </div>
+       {pollutionData?.geohash && (
+          <div className="location-info">
+              Geohash: {pollutionData.geohash} ({pollutionData.latitude?.toFixed(4)}, {pollutionData.longitude?.toFixed(4)})
+          </div>
+       )}
     </div>
   );
 };

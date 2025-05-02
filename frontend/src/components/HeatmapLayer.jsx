@@ -5,163 +5,158 @@ import L from 'leaflet';
 import 'leaflet.heat';
 
 // Add custom canvas setup function to set willReadFrequently attribute
+// Still potentially useful for performance even without complex reads.
 const createCustomHeatLayer = (options) => {
-  const originalHeatLayer = L.heatLayer([], options);
-  
+  const heatLayer = L.heatLayer([], options); // Start with empty data
+
   // Override the _initCanvas method to set willReadFrequently
-  const originalInitCanvas = originalHeatLayer._initCanvas;
-  originalHeatLayer._initCanvas = function() {
+  const originalInitCanvas = heatLayer._initCanvas;
+  heatLayer._initCanvas = function() {
     originalInitCanvas.call(this);
     if (this._canvas) {
-      const ctx = this._canvas.getContext('2d');
-      if (ctx && typeof ctx.canvas.setAttribute === 'function') {
-        ctx.canvas.setAttribute('willReadFrequently', 'true');
-      }
+      // Standard way to get context without triggering warnings
+      const ctx = this._canvas.getContext('2d', { willReadFrequently: true });
+      // Note: Setting the attribute directly might also work but getContext is preferred
+      // if (ctx && typeof this._canvas.setAttribute === 'function') {
+      //  this._canvas.setAttribute('willReadFrequently', 'true');
+      //}
     }
   };
-  
-  return originalHeatLayer;
+
+  return heatLayer;
 };
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
 /* ------------------------------------------------------------------ */
-const getGridSize = z =>
-  z <= 3 ? 0.5 :
-  z <= 5 ? 0.2 :
-  z <= 7 ? 0.1 :
-  z <= 9 ? 0.05 :
-  z <= 11 ? 0.02 : 0.01;
-
+// Define maximum expected values for normalization (adjust as needed)
 const getMaxIntensity = param => {
   switch (param) {
-    case 'pm10': return 100;
-    case 'no2' : return 80;
-    case 'so2' : return 40;
-    case 'o3'  : return 150;
-    default    : return 50; // pm25
+    case 'pm10': return 150; // Higher typical max for PM10
+    case 'no2' : return 100; // Increased slightly
+    case 'so2' : return 60;  // Increased slightly
+    case 'o3'  : return 180; // Higher typical max for O3
+    case 'pm25':
+    default    : return 100; // Increased max for PM2.5 for better gradient spread
   }
 };
+
+// Define base radius and blur, potentially adjust by zoom later if needed
+const BASE_RADIUS = 80; // Increased significantly for global spread
+const BASE_BLUR = 60;  // Increased significantly for smoother look
 
 /* ------------------------------------------------------------------ */
 /* Component                                                          */
 /* ------------------------------------------------------------------ */
-const HeatmapLayer = ({ points, selectedParam }) => {
-  const map                = useMap();
-  const heatLayerRef       = useRef(null);
-  const noDataLayerRef     = useRef(null);
-  const [zoom, setZoom]    = useState(map ? map.getZoom() : 10); // Add null check
-  const [mapReady, setMapReady] = useState(false); // Track if map is ready
+const HeatmapLayer = ({ points = [], selectedParam = 'pm25' }) => {
+  const map = useMap();
+  const heatLayerRef = useRef(null);
+  const [mapReady, setMapReady] = useState(!!map); // Initialize based on map existence
 
-  /* ----- listen for zoom changes ---------------------------------- */
+  /* ----- listen map load event ------------------------------------ */
   useMapEvents({
-    zoomend: () => {
-      if (map) setZoom(map.getZoom());
-    },
     load: () => {
+      console.log("Heatmap: Map loaded event received.");
       setMapReady(true);
-    }
+    },
+    // Optional: Can listen to zoom to adjust radius/blur later
+     zoomend: () => { /* update radius/blur based on map.getZoom() */ }
   });
 
-  /* ----- once: create the two layers ------------------------------ */
+  /* ----- once: create the layer ----------------------------------- */
   useEffect(() => {
-    // Only add layers when map is available
-    if (!map) return;
-    
-    // Use our custom function to create heat layers with willReadFrequently set to true
-    heatLayerRef.current = createCustomHeatLayer({ minOpacity: 0.4 }).addTo(map);
-    noDataLayerRef.current = createCustomHeatLayer({ minOpacity: 0.3 }).addTo(map);
+    // Guard against map not being ready yet
+    if (!map) {
+      console.log("Heatmap: Map not available on initial effect.");
+      return;
+    }
+     if (!mapReady) {
+       console.log("Heatmap: Map not ready on initial effect.");
+       return; // Explicitly wait for mapReady state
+     }
 
-    setMapReady(true);
+    console.log("Heatmap: Creating heatmap layer.");
+    // Use our custom function to create heat layers
+    heatLayerRef.current = createCustomHeatLayer({
+      minOpacity: 0.3, // Start slightly visible
+      radius: BASE_RADIUS,
+      blur: BASE_BLUR,
+      maxZoom: 18, // Adjust as needed
+      max: 1.0,    // Intensity will be normalized between 0 and 1
+       gradient: { // Example gradient (adjust colors for desired look)
+          0.0: 'rgba(0, 0, 255, 0)', // Fully transparent blue start
+          0.1: 'blue',
+          0.2: 'cyan',
+          0.4: 'lime',
+          0.6: 'yellow',
+          0.8: 'orange',
+          1.0: 'red'
+        }
+    }).addTo(map);
+
 
     return () => {
-      if (heatLayerRef.current && map) map.removeLayer(heatLayerRef.current);
-      if (noDataLayerRef.current && map) map.removeLayer(noDataLayerRef.current);
+       console.log("Heatmap: Cleaning up heatmap layer.");
+      if (heatLayerRef.current && map.hasLayer(heatLayerRef.current)) {
+         map.removeLayer(heatLayerRef.current);
+         heatLayerRef.current = null; // Clear ref on cleanup
+      }
     };
-  }, [map]);
+  }, [map, mapReady]); // Depend on map instance and mapReady state
 
-  /* ----- update data every time zoom / points / parameter change -- */
+  /* ----- update data when points / parameter change --------------- */
   useEffect(() => {
-    // Make sure map and layers are ready
-    if (!map || !heatLayerRef.current || !mapReady) return;
-    
+    // Ensure map and layer are ready
+    if (!map || !heatLayerRef.current || !mapReady) {
+       console.log(`Heatmap: Skipping update (Map: ${!!map}, Layer: ${!!heatLayerRef.current}, Ready: ${mapReady})`);
+       return;
+    }
+
+    console.log(`Heatmap: Updating with ${points.length} points for param ${selectedParam}`);
+
     try {
-      const bounds = map.getBounds();
-      if (!bounds) return; // If bounds aren't available yet, skip this update
-      
-      const gSize     = getGridSize(zoom);
-      const minLat    = bounds.getSouth();
-      const maxLat    = bounds.getNorth();
-      const minLng    = bounds.getWest();
-      const maxLng    = bounds.getEast();
-
-      /* --- build a hash of visible grid cells ----------------------- */
-      const cells = Object.create(null);
-      for (let lat = Math.floor(minLat / gSize) * gSize; lat <= maxLat; lat += gSize) {
-        for (let lng = Math.floor(minLng / gSize) * gSize; lng <= maxLng; lng += gSize) {
-          const key     = `${lat.toFixed(4)}_${lng.toFixed(4)}`;
-          cells[key]    = { lat: lat + gSize / 2, lng: lng + gSize / 2,
-                            tot: 0, cnt: 0       };
-        }
-      }
-
-      /* --- aggregate measurement points into those cells ------------ */
+      // The backend provides aggregated points (AggregatedAirQualityPoint)
+      // We need the average value for the selected parameter.
       const valueKey = `avg_${selectedParam}`;
-      for (const p of points) {
-        const v = p[valueKey];
-        if (v == null || isNaN(v)) continue;
+      const maxIntensity = getMaxIntensity(selectedParam);
 
-        const cLat  = Math.floor(p.latitude  / gSize) * gSize;
-        const cLng  = Math.floor(p.longitude / gSize) * gSize;
-        const cKey  = `${cLat.toFixed(4)}_${cLng.toFixed(4)}`;
+      const heatPoints = points
+        .map(p => {
+          const value = p[valueKey];
 
-        if (!cells[cKey]) continue;            // outside current bounds
-        cells[cKey].tot += v;
-        cells[cKey].cnt += 1;
-      }
+          // Basic validation for required fields
+          if (value == null || isNaN(value) || p.latitude == null || p.longitude == null) {
+            // console.warn("Skipping point due to missing data:", p);
+            return null; // Skip points with missing essential data
+          }
 
-      /* --- split into “real” data & “no-data placeholders” ---------- */
-      const heatPts    = [];
-      const maxInt     = getMaxIntensity(selectedParam);
+          // Normalize intensity: value relative to maxIntensity, clamped between 0 and 1
+          const intensity = Math.min(Math.max(value / maxIntensity, 0), 1.0);
 
-      Object.values(cells).forEach(c => {
-        if (c.cnt > 0) {
-          const avg = c.tot / c.cnt;
-          // Use average directly for intensity, capped by maxInt
-          const intensity = Math.min(avg / maxInt, 1.0);
-          heatPts.push([c.lat, c.lng, intensity]);
-        }
-      });
+          // Return leaflet.heat compatible array: [lat, lng, intensity]
+          return [p.latitude, p.longitude, intensity];
+        })
+        .filter(p => p !== null); // Filter out skipped points
 
-      /* --- push data into the two layers ---------------------------- */
-      heatLayerRef.current.setOptions({
-        // Increase radius and blur significantly for a smoother, more spread-out look
-        radius: 60, 
-        blur: 50, 
-        maxZoom: 18, // Allow heatmap effect at higher zooms if desired
-        max: 1.0, // Intensity is now normalized between 0 and 1
-        // Adjusted gradient for a smoother transition and different color scheme
-        gradient: {
-          0.0: 'rgba(0, 119, 190, 0.2)',  // Lighter Blue, slightly transparent start
-          0.2: '#00a8a8', // Teal
-          0.4: '#60c060', // Green
-          0.6: '#f0e040', // Yellow
-          0.8: '#f08000', // Orange
-          1.0: '#e00000'  // Red
-        }
-      });
-      heatLayerRef.current.setLatLngs(heatPts);
+      console.log(`Heatmap: Processed ${heatPoints.length} valid points for rendering.`);
 
-      // Ensure noDataLayer remains empty/invisible
-      if (noDataLayerRef.current) {
-        noDataLayerRef.current.setLatLngs([]);
-      }
+      // Update the heatmap layer's data
+      heatLayerRef.current.setLatLngs(heatPoints);
+
+      // Optional: Adjust radius/blur based on current zoom?
+       const currentZoom = map.getZoom();
+       const radius = calculateRadiusForZoom(currentZoom); // Implement this function if needed
+       const blur = calculateBlurForZoom(currentZoom); // Implement this function if needed
+       heatLayerRef.current.setOptions({ radius, blur });
+
+
     } catch (error) {
       console.error('Error updating heatmap layer:', error);
     }
-  }, [zoom, points, selectedParam, map, mapReady]);
+  }, [points, selectedParam, map, heatLayerRef.current, mapReady]); // Add mapReady dependency
 
-  return null;
+
+  return null; // This component only adds a layer to the map
 };
 
 export default HeatmapLayer;
