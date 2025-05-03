@@ -16,6 +16,7 @@
     "leaflet": "^1.9.4",
     "leaflet.heat": "^0.2.0",
     "leaflet.markercluster": "^1.5.3",
+    "lodash": "^4.17.21",
     "ngeohash": "^0.6.3",
     "react": "^19.0.0",
     "react-chartjs-2": "^5.3.0",

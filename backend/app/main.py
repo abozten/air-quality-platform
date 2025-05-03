@@ -11,7 +11,7 @@ from fastapi import FastAPI, Query, HTTPException, Body, status, WebSocket, WebS
 from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint
 from .db_client import (
     query_latest_location_data,
-    query_recent_points,
+    query_raw_points_in_bbox,
     query_anomalies_from_db,
     query_density_in_bbox,
     close_influx_client,
@@ -77,46 +77,77 @@ app.add_middleware(
 # --- API Endpoints ---
 API_PREFIX = "/api/v1"
 
+def zoom_to_geohash_precision_backend(zoom: Optional[int]) -> int:
+    """ Maps map zoom level to backend geohash aggregation precision. """
+    if zoom is None: return 4 # Default if zoom not provided
+    if zoom <= 3: return 2    # Very coarse for world view
+    if zoom <= 5: return 3    # Coarse for continent/country
+    if zoom <= 7: return 4    # Medium for region
+    if zoom <= 10: return 5   # Finer for city/area
+    if zoom <= 13: return 6   # Fine for neighborhood
+    return 7                  # Very fine for street level (max reasonable default)
+
+
+# --- NEW Endpoint for Heatmap Data ---
+@app.get(
+    f"{API_PREFIX}/air_quality/heatmap_data",
+    response_model=List[AggregatedAirQualityPoint],
+    summary="Get Aggregated Data for Heatmap",
+    description="Retrieves raw air quality readings within the specified bounding box and time window, aggregates them into geohash cells based on the zoom level, and returns the average values suitable for heatmap rendering."
+)
+async def get_heatmap_data(
+    min_lat: float = Query(..., description="Minimum latitude of the bounding box.", ge=-90, le=90),
+    max_lat: float = Query(..., description="Maximum latitude of the bounding box.", ge=-90, le=90),
+    min_lon: float = Query(..., description="Minimum longitude of the bounding box.", ge=-180, le=180),
+    max_lon: float = Query(..., description="Maximum longitude of the bounding box.", ge=-180, le=180),
+    zoom: Optional[int] = Query(None, description="Current map zoom level, used to determine aggregation precision."),
+    window: str = Query("1h", description="Time window to fetch data from (e.g., '1h', '24h', '15m'). Format: InfluxDB duration literal."),
+    # Consider adding a limit parameter for raw points fetched?
+    # raw_point_limit: int = Query(5000, gt=0, le=20000, description="Maximum raw points to fetch before aggregation.")
+):
+    logger.info(f"Request for heatmap data: bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}], zoom={zoom}, window={window}")
+
+    # Basic validation
+    if min_lat >= max_lat or min_lon >= max_lon:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid bounding box coordinates: min values must be less than max values."
+        )
+
+    # 1. Fetch raw points within the bounding box
+    # Using a default limit defined in the db_client function for now
+    raw_readings = query_raw_points_in_bbox(
+        min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon,
+        window=window
+        # limit=raw_point_limit # Pass limit if added as query param
+    )
+
+    if not raw_readings:
+        logger.info("No raw points found in the specified bbox and window.")
+        return []
+
+    # 2. Determine geohash precision for aggregation based on zoom
+    aggregation_precision = zoom_to_geohash_precision_backend(zoom)
+    logger.info(f"Using aggregation precision: {aggregation_precision} for zoom {zoom}")
+
+    # 3. Aggregate the fetched raw points using the calculated precision
+    aggregated_data = aggregate_by_geohash(
+        points=raw_readings,
+        precision=aggregation_precision
+        # No max_cells limit needed here usually, heatmap handles density visually
+    )
+
+    logger.info(f"Returning {len(aggregated_data)} aggregated points for heatmap.")
+    return aggregated_data
+
+
 # --- Endpoint for Aggregated Points (Map View) ---
 @app.get(
-    f"{API_PREFIX}/air_quality/points",
+    f"{API_PREFIX}/air_quality/pointsretired",
     response_model=List[AggregatedAirQualityPoint],
-    summary="Get Aggregated Air Quality Points (DB Aggregation)", # Updated summary
-    description="Retrieves air quality readings aggregated directly within InfluxDB into geohash grid cells based on the requested precision. Returns average values and counts for each cell." # Updated description
+    summary="Get Aggregated Air Quality Points",
+    description="Retrieves recent air quality readings, aggregates them into geohash grid cells, and returns the average values for each cell. Useful for map visualization."
 )
-async def get_aggregated_air_quality_points(
-    limit: int = Query(100, gt=0, le=1000, description="Maximum number of aggregated geohash grid cells to return."), # Increased max limit example
-    window: str = Query("1h", description="Time window to query data from (e.g., '1h', '24h', '15m'). Format: InfluxDB duration literal."),
-    geohash_precision: int = Query(6, ge=1, le=9, description="Geohash precision for spatial aggregation. Lower value = larger grid cells.")
-):
-    """
-    Queries the database to get pre-aggregated data points based on the
-    specified geohash precision and time window.
-    """
-    logger.info(f"Request for DB-aggregated points: limit={limit}, window={window}, geohash_precision={geohash_precision}")
-
-    # Directly call the new database function that performs aggregation
-    try:
-        aggregated_points = db_client.query_aggregated_points(
-            geohash_precision=geohash_precision,
-            limit=limit,
-            window=window
-        )
-    except Exception as e:
-         # Catch potential errors during the DB call itself
-         logger.error(f"Error calling query_aggregated_points: {e}", exc_info=True)
-         raise HTTPException(status_code=500, detail="Failed to retrieve aggregated points from database.")
-
-
-    if not aggregated_points:
-        logger.info(f"No aggregated points found for precision {geohash_precision}, window {window}.")
-        return [] # Return empty list, not an error
-
-    # No more Python aggregation needed here!
-    # The sampling logic is also removed as aggregation happens first in DB.
-
-    logger.info(f"Returning {len(aggregated_points)} aggregated points from DB query.")
-    return aggregated_points
 
 # --- Endpoint for Anomalies ---
 @app.get(

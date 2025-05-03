@@ -52,8 +52,119 @@ except Exception as e:
     write_api = None
     query_api = None
 
+def query_raw_points_in_bbox(
+    min_lat: float, max_lat: float, min_lon: float, max_lon: float,
+    window: str = "1h", limit: int = 5000
+) -> List[AirQualityReading]:
+    """
+    Queries raw (unaggregated) air quality readings within a given bounding box
+    and time window. Returns a list of AirQualityReading objects.
+    A limit is applied to prevent excessive data retrieval.
+    FIXED: Handles potential float conversion errors before filtering.
+    """
+    if not query_api:
+        logger.error("InfluxDB query_api not available for bbox query.")
+        return []
 
-# --- Query Function for Multiple Points  (air_quality/points)---
+    if min_lat >= max_lat or min_lon >= max_lon:
+        logger.warning(f"Invalid bounding box received: {min_lat},{min_lon} -> {max_lat},{max_lon}")
+        return []
+
+    # Flux query - FIXED
+    flux_query = f'''
+        import "math"
+        import "types"
+
+        from(bucket: "{influx_bucket}")
+          |> range(start: -{window})
+          |> filter(fn: (r) => r["_measurement"] == "air_quality")
+          |> filter(fn: (r) => exists r.latitude and exists r.longitude) // Ensure tags exist
+          // Map tags to potential floats. Conversion errors might result in null or error state.
+          |> map(fn: (r) => ({{ r with
+                latitude_float: float(v: r.latitude),
+                longitude_float: float(v: r.longitude)
+             }}))
+          // *** FIX: Add filter *after* map to ensure conversion resulted in numeric types ***
+          |> filter(fn: (r) =>
+                 types.isNumeric(v: r.latitude_float) and
+                 types.isNumeric(v: r.longitude_float)
+             )
+          // Now, safely filter by the numeric lat/lon ranges
+          |> filter(fn: (r) =>
+                 r.latitude_float >= {min_lat} and r.latitude_float <= {max_lat} and
+                 r.longitude_float >= {min_lon} and r.longitude_float <= {max_lon}
+             )
+          // Filter the actual measurement value (_value column)
+          |> filter(fn: (r) => types.isNumeric(v: r._value) and not math.isNaN(f: r._value))
+          // Pivot fields into columns
+          |> pivot(
+                rowKey:["_time", "latitude", "longitude", "geohash"], // Keep original tags + geohash
+                columnKey: ["_field"],
+                valueColumn: "_value"
+             )
+          |> limit(n: {limit}) // Apply limit
+    '''
+    logger.debug(f"Executing FIXED Flux query for raw points in bbox (limit {limit}):\n{flux_query}")
+
+    results: List[AirQualityReading] = []
+    try:
+        tables = query_api.query(query=flux_query, org=influx_org)
+        if not tables:
+            logger.info(f"No raw points found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] window {window}.")
+            return []
+
+        processed_times = set()
+
+        for table in tables:
+            for record in table.records:
+                record_time = record.get_time()
+                point_key = (record_time, record.values.get("latitude"), record.values.get("longitude"))
+
+                if point_key in processed_times:
+                    continue
+                processed_times.add(point_key)
+
+                try:
+                    data = record.values
+                    lat_str = data.get("latitude")
+                    lon_str = data.get("longitude")
+
+                    if lat_str is None or lon_str is None:
+                        # This check might be redundant now due to the improved Flux filter, but keep for safety
+                        logger.warning(f"Skipping record due to missing lat/lon tag after pivot/filter: {data}")
+                        continue
+
+                    # Ensure conversion here matches the Pydantic model types
+                    reading = AirQualityReading(
+                        latitude=float(lat_str),
+                        longitude=float(lon_str),
+                        timestamp=record_time,
+                        pm25=data.get('pm25'), # Already pivoted, access directly
+                        pm10=data.get('pm10'),
+                        no2=data.get('no2'),
+                        so2=data.get('so2'),
+                        o3=data.get('o3'),
+                    )
+                    results.append(reading)
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Error processing raw point record (parsing/type error): {e} - Record: {record.values}", exc_info=False)
+                except Exception as e:
+                    logger.error(f"Unexpected error processing raw point record: {e} - Record: {record.values}", exc_info=True)
+
+        logger.info(f"Retrieved {len(results)} raw points from bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] window {window}.")
+        return results
+
+    except InfluxDBError as e:
+        logger.error(f"InfluxDB Error querying raw points in bbox: {e}", exc_info=True)
+        if hasattr(e, 'response') and e.response and hasattr(e.response, 'data'):
+             # Log the detailed Flux error message from the response body
+             flux_error_msg = e.response.data.decode() if isinstance(e.response.data, bytes) else str(e.response.data)
+             logger.error(f"InfluxDB Response Body: {flux_error_msg}")
+        return []
+    except Exception as e:
+        logger.error(f"Generic error querying raw points in bbox: {e}", exc_info=True)
+        return []
+# --- Query Function for Multiple Points  (air_quality/points)--- DEPRECATED ---
 def query_recent_points(limit: int = 50, window: str = "1h") -> List[AirQualityReading]:
     """
     Queries the latest distinct air quality readings from different locations

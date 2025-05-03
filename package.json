@@ -2,6 +2,7 @@
   "dependencies": {
     "@turf/helpers": "^7.2.0",
     "@turf/interpolate": "^7.2.0",
+    "lodash": "^4.17.21",
     "ngeohash": "^0.6.3"
   }
 }
