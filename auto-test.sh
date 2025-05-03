@@ -1,183 +1,107 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Script to scan Europe at ~4 km resolution, send
+# all AQ parameters, with anomalies.
 
-# Script to automatically send random (and potentially anomalous) air quality data
-# to the API endpoint to simulate load and test scenarios.
+set -euo pipefail
 
 # --- Configuration ---
 API_ENDPOINT="${API_BASE_URL:-http://localhost:8000/api/v1}/air_quality/ingest"
 PARAMETERS=("pm25" "pm10" "no2" "so2" "o3")
-NUM_PARAMS=${#PARAMETERS[@]}
 
 # Default values
-DEFAULT_DURATION=30      # seconds
-DEFAULT_RATE=5           # requests per second
-DEFAULT_ANOMALY_CHANCE=10 # percentage (0-100)
+DEFAULT_RATE=5            # requests per second
+DEFAULT_ANOMALY_CHANCE=0.001  # percent
 
-# --- Helper Functions ---
-log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $@"
-}
+# 4 km ≈ 0.0359° (1° lat ≈ 111.32 km)
+DELTA_DEG=0.0359
 
-# Function to generate random float using awk (more portable than other methods)
-# Usage: random_float MIN MAX
+# Europe bounding box
+LAT_MIN=34
+LAT_MAX=72
+LON_MIN=-25
+LON_MAX=45
+
+# --- Logging ---
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"; }
+
+# --- Random float generator ---
 random_float() {
-    local min=$1
-    local max=$2
-    # Seed awk's rand() using nanoseconds for better randomness per call
-    awk -v min="$min" -v max="$max" 'BEGIN{srand(); print min+rand()*(max-min)}'
+  awk -v min="$1" -v max="$2" 'BEGIN{srand(); printf("%.6f\n", min+rand()*(max-min))}'
 }
 
-# --- Parse Command Line Arguments ---
-DURATION=$DEFAULT_DURATION
-RATE=$DEFAULT_RATE
-ANOMALY_CHANCE=$DEFAULT_ANOMALY_CHANCE
+# --- Anomaly decision (0=anomaly, 1=normal) ---
+is_anomaly() {
+  awk -v c="$1" 'BEGIN{srand(); exit (rand()*100 < c ? 0 : 1)}'
+}
 
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --duration=*) DURATION="${1#*=}";;
-        --rate=*) RATE="${1#*=}";;
-        --anomaly-chance=*) ANOMALY_CHANCE="${1#*=}";;
-        -h|--help)
-            echo "Usage: $0 [--duration=<seconds>] [--rate=<requests_per_second>] [--anomaly-chance=<percentage>]"
-            echo "Defaults: duration=${DEFAULT_DURATION}s, rate=${DEFAULT_RATE}/s, anomaly_chance=${DEFAULT_ANOMALY_CHANCE}%"
-            exit 0
-            ;;
-        *) echo "Unknown parameter passed: $1"; exit 1 ;;
-    esac
-    shift
+# --- Parse args ---
+RATE=${DEFAULT_RATE}
+ANOMALY_CHANCE=${DEFAULT_ANOMALY_CHANCE}
+for arg in "$@"; do
+  case $arg in
+    --rate=*)           RATE="${arg#*=}"           ;;
+    --anomaly-chance=*) ANOMALY_CHANCE="${arg#*=}" ;;
+    -h|--help)
+      cat <<EOF
+Usage: $0 [--rate=<req/sec>] [--anomaly-chance=<percent>]
+EOF
+      exit 0
+      ;;
+    *) log "ERROR: Unknown arg: $arg"; exit 1;;
+  esac
 done
 
-# Input validation
-if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -le 0 ]; then
-    log "Error: Invalid duration. Must be a positive integer."
-    exit 1
-fi
-if ! [[ "$RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || (( $(echo "$RATE <= 0" | bc -l) )); then
-    log "Error: Invalid rate. Must be a positive number."
-    exit 1
-fi
-if ! [[ "$ANOMALY_CHANCE" =~ ^[0-9]+$ ]] || [ "$ANOMALY_CHANCE" -lt 0 ] || [ "$ANOMALY_CHANCE" -gt 100 ]; then
-    log "Error: Invalid anomaly chance. Must be an integer between 0 and 100."
-    exit 1
-fi
-
-# Calculate sleep time between requests
-# Use bc for floating point division
-if (( $(echo "$RATE > 0" | bc -l) )); then
-    SLEEP_TIME=$(echo "scale=4; 1 / $RATE" | bc)
+# --- Compute sleep ---
+if awk "BEGIN{exit !($RATE>0)}"; then
+  SLEEP=$(awk -v r="$RATE" 'BEGIN{printf("%.6f", 1/r)}')
 else
-    SLEEP_TIME=1 # Avoid division by zero, default to 1s if rate is somehow 0
+  log "ERROR: --rate must be >0"; exit 1
 fi
 
-
-log "Starting auto-test..."
-log "Duration: ${DURATION} seconds"
-log "Rate: ${RATE} requests/second (sleep ${SLEEP_TIME}s between requests)"
-log "Anomaly Chance: ${ANOMALY_CHANCE}%"
-log "Target API: ${API_ENDPOINT}"
+log "Scanning Europe: lat ${LAT_MIN}→${LAT_MAX}, lon ${LON_MIN}→${LON_MAX}"
+log "Grid step: ${DELTA_DEG}° (~4 km), Rate: $RATE req/s, Anomaly: ${ANOMALY_CHANCE}%"
+log "API endpoint: $API_ENDPOINT"
 
 # --- Main Loop ---
-START_TIME=$(date +%s)
-END_TIME=$((START_TIME + DURATION))
-REQUEST_COUNT=0
+TOTAL=0
+for lat in $(seq "$LAT_MIN" "$DELTA_DEG" "$LAT_MAX"); do
+  for lon in $(seq "$LON_MIN" "$DELTA_DEG" "$LON_MAX"); do
+    # start JSON
+    JSON="{\"latitude\":$(printf '%.6f' "$lat"),\"longitude\":$(printf '%.6f' "$lon")}"
 
-while [ $(date +%s) -lt $END_TIME ]; do
-    REQUEST_COUNT=$((REQUEST_COUNT + 1))
-    # Generate random location
-    LAT=$(random_float -90 90)
-    LON=$(random_float -180 180)
+    # append each parameter
+    for p in "${PARAMETERS[@]}"; do
+      if is_anomaly "$ANOMALY_CHANCE"; then
+        case $p in
+          pm25) v=$(random_float 250.1 500.0);;
+          pm10) v=$(random_float 420.1 800.0);;
+          no2)  v=$(random_float 200.1 400.0);;
+          so2)  v=$(random_float 50.1 150.0);;
+          o3)   v=$(random_float 240.1 400.0);;
+        esac
+      else
+        case $p in
+          pm25) v=$(random_float 5.0 80.0);;
+          pm10) v=$(random_float 10.0 150.0);;
+          no2)  v=$(random_float 10.0 100.0);;
+          so2)  v=$(random_float 1.0 20.0);;
+          o3)   v=$(random_float 20.0 180.0);;
+        esac
+      fi
+      JSON=$(jq -n --argjson base "$(echo "$JSON" | jq '.')" --arg p "$p" --argjson val "$v" '$base + {($p): $val}')
+    done
 
-    # Select random parameter
-    PARAM_INDEX=$(( RANDOM % NUM_PARAMS ))
-    PARAM_NAME=${PARAMETERS[$PARAM_INDEX]}
-
-    # Decide if this request is an anomaly
-    IS_ANOMALY=false
-    RAND_CHANCE=$(( RANDOM % 100 )) # 0-99
-    if [ "$RAND_CHANCE" -lt "$ANOMALY_CHANCE" ]; then
-        IS_ANOMALY=true
-    fi
-
-    # Generate value based on parameter and anomaly status
-    case "$PARAM_NAME" in
-        pm25)
-            if $IS_ANOMALY; then
-                VALUE=$(random_float 250.1 500.0) # High anomalous value
-                log ">>> Generating ANOMALY for PM2.5: ${VALUE}"
-            else
-                VALUE=$(random_float 5.0 80.0)   # Normal range
-            fi
-            ;;
-        pm10)
-             if $IS_ANOMALY; then
-                VALUE=$(random_float 420.1 800.0) # High anomalous value
-                log ">>> Generating ANOMALY for PM10: ${VALUE}"
-            else
-                VALUE=$(random_float 10.0 150.0)  # Normal range
-            fi
-            ;;
-        no2)
-             if $IS_ANOMALY; then
-                VALUE=$(random_float 200.1 400.0) # High anomalous value
-                log ">>> Generating ANOMALY for NO2: ${VALUE}"
-            else
-                VALUE=$(random_float 10.0 100.0)  # Normal range
-            fi
-            ;;
-        so2)
-             if $IS_ANOMALY; then
-                VALUE=$(random_float 50.1 150.0) # High anomalous value (adjust threshold as needed)
-                log ">>> Generating ANOMALY for SO2: ${VALUE}"
-            else
-                VALUE=$(random_float 1.0 20.0)   # Normal range
-            fi
-            ;;
-        o3)
-             if $IS_ANOMALY; then
-                VALUE=$(random_float 240.1 400.0) # High anomalous value (adjust threshold as needed)
-                log ">>> Generating ANOMALY for O3: ${VALUE}"
-            else
-                VALUE=$(random_float 20.0 180.0)  # Normal range
-            fi
-            ;;
-        *)
-            VALUE=$(random_float 0.0 100.0) # Default fallback
-            ;;
-    esac
-
-    # Construct JSON Payload (using jq if available, fallback otherwise)
-    JSON_PAYLOAD=""
-    if command -v jq &> /dev/null; then
-        JSON_PAYLOAD=$(jq -n \
-            --arg lat "$LAT" \
-            --arg lon "$LON" \
-            --arg param "$PARAM_NAME" \
-            --argjson val "$VALUE" \
-            '{latitude: ($lat | tonumber), longitude: ($lon | tonumber), ($param): $val}')
-    else
-        JSON_PAYLOAD="{\"latitude\": ${LAT}, \"longitude\": ${LON}, \"${PARAM_NAME}\": ${VALUE}}"
-    fi
-
-    # Send data using curl IN BACKGROUND (&) to achieve desired rate
-    # Use -s for silent, -o /dev/null to discard output, optionally -w for status code
-    # Add timeout options for robustness
-    curl -X POST \
+    # send in background
+    curl -s -o /dev/null -X POST \
          -H "Content-Type: application/json" \
-         -d "$JSON_PAYLOAD" \
-         --connect-timeout 5 \
-         --max-time 10 \
-         -s -o /dev/null \
+         -d "$JSON" \
          "$API_ENDPOINT" &
 
-    # Sleep to maintain the target rate
-    sleep "$SLEEP_TIME"
+    ((TOTAL++))
+    sleep "$SLEEP"
+  done
 done
 
-log "Test duration reached. Waiting for background requests to complete..."
-# Wait for all background curl processes to finish
 wait
-CURRENT_TIME=$(date +%s)
-ACTUAL_DURATION=$((CURRENT_TIME - START_TIME))
-log "Auto-test finished after ${ACTUAL_DURATION} seconds. Sent ${REQUEST_COUNT} requests."
-
-exit 0
+log "Done. Sent $TOTAL requests (~$(printf '%.1f' "$((TOTAL/RATE/3600))") hours)."
