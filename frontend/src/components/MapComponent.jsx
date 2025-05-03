@@ -365,7 +365,7 @@ const MapComponent = ({
     onLocationSelect    // Callback function: (data) => void - Called with data from map click
 }) => {
   const initialPosition = [20, 0]; // Initial map center (latitude, longitude)
-  const initialZoom = 2;           // Initial map zoom level
+  const initialZoom = 3;           // Initial map zoom level
 
   // State for the heatmap data points
   const [heatmapPoints, setHeatmapPoints] = useState([]);
@@ -436,7 +436,7 @@ const MapComponent = ({
       <MapContainer
         center={initialPosition}
         zoom={initialZoom}
-        minZoom={2} // Set a minimum zoom level
+        minZoom={3} // Set a minimum zoom level
         style={{ height: '100%', width: '100%' }} // Make map fill its container
         worldCopyJump={true} // Prevents map from repeating infinitely when panning horizontally
         zoomControl={false} // Disable default zoom control to reposition it
@@ -473,28 +473,6 @@ const MapComponent = ({
   );
 };
 
-// Add basic styles for indicators (add to a relevant CSS file like App.css or MapComponent.css)
-/*
-.map-loading-indicator, .map-error-indicator {
-  position: absolute;
-  top: 15px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 1001; // Ensure it's above map layers
-  background: rgba(40, 44, 52, 0.85);
-  color: #fff;
-  padding: 10px 20px;
-  border-radius: 5px;
-  font-size: 0.9em;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.3);
-  pointer-events: none; // Allow clicks to pass through
-  backdrop-filter: blur(3px);
-  -webkit-backdrop-filter: blur(3px);
-}
-.map-error-indicator {
-  background: rgba(217, 30, 24, 0.85); // Red for error
-  top: 60px; // Position below loading indicator if both might appear
-}
-*/
+
 
 export default MapComponent;

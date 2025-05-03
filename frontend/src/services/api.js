@@ -30,12 +30,36 @@ export const zoomToGeohashPrecision = (zoom) => {
   return 6;
 };
 
-// Fetch aggregated air quality points for the map visualization
-export const fetchAirQualityPoints = async (limit = 2000, zoom = 2) => {
-  const precision = zoomToGeohashPrecision(zoom);
-  const response = await fetch(`${API_BASE_URL}/air_quality/points?limit=${limit}&geohash_precision=${precision}`);
+// --- NEW: Fetch Heatmap Data ---
+/**
+ * Fetches aggregated air quality data specifically for heatmap rendering
+ * based on the current map view bounds and zoom level.
+ * @param {number} minLat
+ * @param {number} maxLat
+ * @param {number} minLon
+ * @param {number} maxLon
+ * @param {number} zoom Current map zoom level
+ * @param {string} window Time window (e.g., '1h', '24h')
+ * @returns {Promise<AggregatedAirQualityPoint[]>}
+ */
+export const fetchHeatmapData = async (minLat, maxLat, minLon, maxLon, zoom, window = '1h') => {
+  const params = new URLSearchParams({
+    min_lat: minLat,
+    max_lat: maxLat,
+    min_lon: minLon,
+    max_lon: maxLon,
+    window: window
+  });
+  // Add zoom only if it's a valid number
+  if (typeof zoom === 'number' && !isNaN(zoom)) {
+      params.append('zoom', zoom);
+  }
+
+  console.log(`API: Fetching heatmap data with params: ${params.toString()}`);
+  const response = await fetch(`${API_BASE_URL}/air_quality/heatmap_data?${params.toString()}`);
   return handleResponse(response);
 };
+
 
 // Fetch specific location data (when clicking on a point) also used for the chart.
 export const fetchAirQualityForLocation = async (lat, lon, zoom = 10, window = '1h') => {
