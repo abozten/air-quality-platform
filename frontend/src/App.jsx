@@ -40,27 +40,14 @@ function App() {
 
   // Fetch location details AND history when a location is selected
   const handleLocationSelect = async (data) => {
-    console.log("App: handleLocationSelect triggered.");
-    console.log("App: Received data:", data); // Log the entire data object
-
-    // Check if data is null or undefined first
-    if (!data) {
-      console.log("App: Received null or undefined data. Cannot fetch history.");
-      setSelectedLocationData(null); // Clear selected data if received data is null/undefined
-      setLocationHistoryData({}); // Clear history
-      setErrorHistory(null);
-      return; // Exit early
-    }
-
+    console.log("App: Location selected/data received:", data);
     setSelectedLocationData(data); // Update state for PollutionChart (bar chart)
 
-    // Reset history data and errors before potentially fetching new data
+    // Reset history data and errors
     setLocationHistoryData({});
     setErrorHistory(null);
 
-    // Explicitly check for geohash
-    if (data.geohash) {
-      console.log(`App: Geohash found: ${data.geohash}. Proceeding to fetch history.`);
+    if (data?.geohash) {
       setIsLoadingHistory(true);
       const geohash = data.geohash;
       const parametersToFetch = ['pm25', 'pm10', 'no2', 'so2', 'o3']; // Parameters for history charts
@@ -89,9 +76,6 @@ function App() {
       } finally {
         setIsLoadingHistory(false);
       }
-    } else {
-      console.log("App: No geohash found in the received data. Cannot fetch history.");
-      // Keep selectedLocationData for the PollutionChart, but history won't load
     }
   };
 
