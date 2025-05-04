@@ -2,7 +2,9 @@
   "dependencies": {
     "@turf/helpers": "^7.2.0",
     "@turf/interpolate": "^7.2.0",
+    "chart.js": "^4.4.9",
     "lodash": "^4.17.21",
-    "ngeohash": "^0.6.3"
+    "ngeohash": "^0.6.3",
+    "react-chartjs-2": "^5.3.0"
   }
 }

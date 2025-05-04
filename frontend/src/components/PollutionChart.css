@@ -1,12 +1,17 @@
 /* frontend/src/components/PollutionChart.css */
 .air-pollution-panel {
-  background-color: #f8f9fa;
-  border-radius: 8px;
+  /* Dark background */
+  background-color: #282c34; /* Dark grey/blue */
+  color: #e0e0e0; /* Light grey text */
   padding: 15px;
-  margin-bottom: 20px;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-  font-family: sans-serif;
-  color: #333;
+  border-radius: 8px;
+  /* Subtle border for definition */
+  border: 1px solid #444;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4); /* Adjusted shadow for dark */
+  min-width: 250px;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-header {
@@ -14,70 +19,50 @@
   justify-content: space-between;
   align-items: center;
   margin-bottom: 15px;
-  border-bottom: 1px solid #dee2e6;
+  flex-wrap: wrap;
+  /* Border below header */
+  border-bottom: 1px solid #444;
   padding-bottom: 10px;
 }
 
 .panel-header h3 {
   margin: 0;
   font-size: 1.1em;
-  font-weight: 600;
+  /* Lighter color for header */
+  color: #ffffff;
 }
 
-.panel-header .timestamp {
+.timestamp {
   font-size: 0.8em;
-  color: #6c757d;
+  /* Slightly lighter grey for timestamp */
+  color: #aaa;
+  margin-left: 10px;
 }
 
-.pollution-charts {
+.pollution-chart-container {
+  position: relative;
+  height: 200px;
+  width: 100%;
+  margin-bottom: 15px;
+}
+
+.no-chart-data {
   display: flex;
-  flex-direction: column;
-  gap: 10px; /* Spacing between pollutant lines */
-}
-
-.chart-line {
-  display: grid;
-  grid-template-columns: 50px 1fr 70px; /* Label | Bar | Value */
+  justify-content: center;
   align-items: center;
-  gap: 10px;
-  width: 100%;
-}
-
-.chart-label {
-  font-size: 0.9em;
-  font-weight: 500;
-  text-align: right;
-  white-space: nowrap;
-}
-
-.chart-visual {
-  width: 100%;
-  /* SVG already handles width/height */
-}
-
-.chart-visual svg rect {
-  transition: width 0.3s ease-in-out; /* Animate bar changes */
-}
-
-
-.chart-value {
-  font-size: 0.9em;
-  font-weight: 600;
-  text-align: right;
-  white-space: nowrap;
-}
-
-.chart-unit {
-  font-size: 0.8em;
-  color: #6c757d;
-  margin-left: 2px;
+  height: 100%;
+  /* Lighter color for placeholder text */
+  color: #888;
+  font-style: italic;
 }
 
 .location-info {
-    margin-top: 15px;
-    font-size: 0.8em;
-    color: #6c757d;
-    text-align: center;
-    border-top: 1px solid #eee;
-    padding-top: 10px;
+  font-size: 0.8em;
+  /* Lighter grey for location info */
+  color: #aaa;
+  margin-top: auto;
+  padding-top: 10px;
+  /* Lighter border */
+  border-top: 1px solid #444;
+  text-align: center;
 }

@@ -144,10 +144,10 @@ const HeatmapLayer = ({ points = [], selectedParam = 'pm25' }) => {
       heatLayerRef.current.setLatLngs(heatPoints);
 
       // Optional: Adjust radius/blur based on current zoom?
-       const currentZoom = map.getZoom();
-       const radius = calculateRadiusForZoom(currentZoom); // Implement this function if needed
-       const blur = calculateBlurForZoom(currentZoom); // Implement this function if needed
-       heatLayerRef.current.setOptions({ radius, blur });
+      // const currentZoom = map.getZoom();
+      // const radius = calculateRadiusForZoom(currentZoom); // Implement this function if needed
+      // const blur = calculateBlurForZoom(currentZoom); // Implement this function if needed
+      // heatLayerRef.current.setOptions({ radius, blur });
 
 
     } catch (error) {

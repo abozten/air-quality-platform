@@ -1,6 +1,6 @@
 // frontend/src/components/MapComponent.jsx
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { MapContainer, TileLayer, useMap, Marker, Tooltip, ZoomControl, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, useMap, Marker, Tooltip, ZoomControl, useMapEvents, Rectangle } from 'react-leaflet'; // Added Rectangle
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import 'leaflet.heat'; // Provides L.heatLayer
@@ -10,6 +10,7 @@ import 'leaflet.markercluster/dist/MarkerCluster.Default.css'; // Import MarkerC
 import * as api from '../services/api'; // Use updated api service
 import HeatmapLayer from './HeatmapLayer'; // Use updated HeatmapLayer
 import { debounce } from 'lodash'; // Import debounce
+import './MapComponent.css'; // Import the CSS file
 
 // Fix for default marker icons issue with webpack/vite
 import iconRetinaUrl from 'leaflet/dist/images/marker-icon-2x.png';
@@ -68,6 +69,137 @@ const AnomalyMarkers = ({ anomalies }) => {
   );
 };
 
+// ========================================================================
+// Sub-component: AreaSelectorHandler
+// Handles drawing a rectangle for area selection and fetching density data
+// ========================================================================
+const AreaSelectorHandler = ({ onBoundsSelected, isEnabled }) => { // Added isEnabled prop
+  const map = useMap();
+  const [startPos, setStartPos] = useState(null);
+  const [endPos, setEndPos] = useState(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const selectionRectangleRef = useRef(null);
+
+  const handleMouseDown = (e) => {
+    // Only start selection if the mode is enabled
+    if (!isEnabled) return;
+
+    // Prevent interfering with map drag
+    map.dragging.disable();
+    setStartPos(e.latlng);
+    setEndPos(e.latlng); // Initialize endPos
+    setIsSelecting(true);
+    console.log("AreaSelect: Mouse Down", e.latlng);
+
+    // Remove previous rectangle if exists
+    if (selectionRectangleRef.current) {
+      map.removeLayer(selectionRectangleRef.current);
+      selectionRectangleRef.current = null;
+    }
+  };
+
+  const handleMouseMove = (e) => {
+    // Only track mouse if selecting
+    if (!isSelecting || !isEnabled) return;
+    setEndPos(e.latlng);
+
+    // Draw/update rectangle
+    if (selectionRectangleRef.current) {
+      selectionRectangleRef.current.setBounds(L.latLngBounds(startPos, e.latlng));
+    } else {
+      selectionRectangleRef.current = L.rectangle(L.latLngBounds(startPos, e.latlng), {
+        color: "#3388ff",
+        weight: 1,
+        fillOpacity: 0.2,
+      }).addTo(map);
+    }
+  };
+
+  const handleMouseUp = (e) => {
+    // Only finish selection if selecting
+    if (!isSelecting || !isEnabled) return;
+
+    map.dragging.enable(); // Re-enable map drag
+    setIsSelecting(false);
+    console.log("AreaSelect: Mouse Up", e.latlng);
+
+    // Ensure startPos and endPos are valid
+    if (!startPos || !endPos) {
+        console.warn("AreaSelect: Invalid start or end position on mouse up.");
+        if (selectionRectangleRef.current) {
+            map.removeLayer(selectionRectangleRef.current);
+            selectionRectangleRef.current = null;
+        }
+        setStartPos(null);
+        setEndPos(null);
+        return;
+    }
+
+    const bounds = L.latLngBounds(startPos, endPos);
+
+    // Check if the area is reasonably large (prevent accidental tiny selections)
+    const southWest = bounds.getSouthWest();
+    const northEast = bounds.getNorthEast();
+    const areaThreshold = 0.001; // Adjust as needed (degrees squared)
+    if (Math.abs(northEast.lat - southWest.lat) * Math.abs(northEast.lng - southWest.lng) < areaThreshold) {
+        console.log("AreaSelect: Selection too small, treating as click.");
+        if (selectionRectangleRef.current) {
+            map.removeLayer(selectionRectangleRef.current);
+            selectionRectangleRef.current = null;
+        }
+        setStartPos(null);
+        setEndPos(null);
+        // Don't call onBoundsSelected for small selections
+        return;
+    }
+
+    console.log("AreaSelect: Bounds selected", bounds);
+    onBoundsSelected(bounds);
+
+    // Reset positions for next selection
+    setStartPos(null);
+    setEndPos(null);
+  };
+
+  useMapEvents({
+    mousedown: handleMouseDown,
+    mousemove: handleMouseMove,
+    mouseup: handleMouseUp,
+  });
+
+  // Cleanup rectangle on unmount or if mode is disabled during selection
+  useEffect(() => {
+    return () => {
+      if (selectionRectangleRef.current) {
+        map.removeLayer(selectionRectangleRef.current);
+        selectionRectangleRef.current = null;
+      }
+      // Ensure dragging is enabled if component unmounts or mode changes mid-drag
+      if (isSelecting) {
+          map.dragging.enable();
+          setIsSelecting(false);
+          setStartPos(null);
+          setEndPos(null);
+      }
+    };
+  }, [map, isSelecting, isEnabled]); // Add isEnabled to dependencies
+
+  // Change cursor style when selection mode is active
+  useEffect(() => {
+    const mapContainer = map.getContainer();
+    if (isEnabled) {
+      mapContainer.style.cursor = 'crosshair';
+    } else {
+      mapContainer.style.cursor = ''; // Reset to default
+    }
+    // Cleanup cursor style on unmount or when isEnabled changes
+    return () => {
+        mapContainer.style.cursor = '';
+    };
+  }, [map, isEnabled]);
+
+  return null; // This component doesn't render anything itself
+};
 
 // ========================================================================
 // Sub-component: MapClickHandler
@@ -263,7 +395,6 @@ const MapClickHandler = ({ selectedParam, onLocationDataLoaded }) => {
   return null; // This component does not render any direct UI elements
 };
 
-
 // ========================================================================
 // Sub-component: MapStyleCustomization
 // Applies dark mode class and styles controls
@@ -310,7 +441,6 @@ const MapStyleCustomization = () => {
   return null; // Component doesn't render anything
 };
 
-
 // ========================================================================
 // Sub-component: MapInteractionHandler
 // Listens to map move/zoom events and triggers debounced data fetch
@@ -355,7 +485,6 @@ const MapInteractionHandler = ({ onMapIdle }) => {
   return null; // Component doesn't render anything
 };
 
-
 // ========================================================================
 // Main MapComponent
 // ========================================================================
@@ -373,6 +502,15 @@ const MapComponent = ({
   const [isLoading, setIsLoading] = useState(false);
   // State for storing errors during heatmap data fetch
   const [error, setError] = useState(null);
+
+  // State for Area Selection / Density Data
+  const [isAreaSelectionMode, setIsAreaSelectionMode] = useState(false); // State for toggling mode
+  const [selectedBounds, setSelectedBounds] = useState(null);
+  const [densityData, setDensityData] = useState(null);
+  const [isDensityLoading, setIsDensityLoading] = useState(false);
+  const [densityError, setDensityError] = useState(null);
+  const densityRectangleRef = useRef(null); // Ref to keep track of the displayed density rectangle
+  const mapRef = useRef(); // Ref for the MapContainer instance
 
   // Callback function triggered by MapInteractionHandler when map becomes idle
   const handleMapIdle = useCallback(async (bounds, zoom) => {
@@ -415,6 +553,178 @@ const MapComponent = ({
     }
   }, []); // useCallback dependencies are empty as it defines the function based on imports
 
+  // Callback function for AreaSelectorHandler
+  const handleBoundsSelected = useCallback((bounds) => {
+    console.log("MapComponent: Received selected bounds", bounds);
+    setSelectedBounds(bounds);
+    setDensityData(null); // Clear previous density data
+    setDensityError(null); // Clear previous errors
+
+    // Remove the previous density rectangle if it exists
+    if (densityRectangleRef.current && mapRef.current) {
+        try {
+            mapRef.current.removeLayer(densityRectangleRef.current);
+        } catch (e) {
+            console.warn("Could not remove previous density rectangle:", e);
+        }
+        densityRectangleRef.current = null;
+    }
+
+    // Draw the final selected rectangle and store its reference
+    if (mapRef.current) {
+        densityRectangleRef.current = L.rectangle(bounds, {
+            color: "#ff7800", // Different color for final selection
+            weight: 2,
+            fillOpacity: 0.1,
+            dashArray: '5, 5' // Dashed line
+        }).addTo(mapRef.current);
+    }
+
+    // IMPORTANT: Turn off selection mode after a successful selection
+    setIsAreaSelectionMode(false);
+
+  }, [mapRef]); // Dependency on mapRef
+
+  // Effect to fetch density data when selectedBounds changes
+  useEffect(() => {
+    if (!selectedBounds) {
+      return;
+    }
+
+    const fetchDensity = async () => {
+      setIsDensityLoading(true);
+      setDensityError(null);
+      const ne = selectedBounds.getNorthEast();
+      const sw = selectedBounds.getSouthWest();
+
+      console.log(`MapComponent: Fetching density for SW(${sw.lat.toFixed(4)}, ${sw.lng.toFixed(4)}) NE(${ne.lat.toFixed(4)}, ${ne.lng.toFixed(4)})`);
+
+      try {
+        const data = await api.fetchPollutionDensity(sw.lat, ne.lat, sw.lng, ne.lng);
+        console.log("MapComponent: Received density data:", data);
+        setDensityData(data);
+      } catch (err) {
+        console.error("MapComponent: Failed to fetch density data:", err);
+        setDensityError(err.message || "Failed to load density data");
+        setDensityData(null); // Clear data on error
+      } finally {
+        setIsDensityLoading(false);
+      }
+    };
+
+    fetchDensity();
+
+  }, [selectedBounds]);
+
+  // Effect to add dynamic CSS for the density display and toggle button
+  useEffect(() => {
+    const styleId = 'density-display-styles';
+    if (document.getElementById(styleId)) return; // Style already added
+
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+      .density-display-panel {
+        position: absolute;
+        bottom: 40px; /* Adjust as needed, above zoom controls */
+        left: 10px;
+        background: rgba(40, 44, 52, 0.85);
+        color: #fff;
+        padding: 8px 12px;
+        border-radius: 5px;
+        z-index: 1000; /* Ensure it's above map layers */
+        font-size: 0.9em;
+        max-width: 250px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        backdrop-filter: blur(3px);
+        -webkit-backdrop-filter: blur(3px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        line-height: 1.5;
+      }
+      .density-display-panel h4 {
+        margin: 0 0 5px 0;
+        font-size: 1.1em;
+        border-bottom: 1px solid #555;
+        padding-bottom: 3px;
+      }
+       .density-display-panel .loading,
+       .density-display-panel .error {
+         font-style: italic;
+         color: #aaa;
+       }
+       .density-display-panel .error {
+         color: #ff8a8a;
+       }
+       .density-display-panel .param-value {
+         margin-left: 5px;
+       }
+       .density-display-panel .param-unit {
+         font-size: 0.8em;
+         opacity: 0.7;
+         margin-left: 2px;
+       }
+       .density-display-panel .data-count {
+         margin-top: 5px;
+         font-size: 0.9em;
+         color: #ccc;
+         border-top: 1px dashed #555;
+         padding-top: 5px;
+       }
+
+      .area-select-toggle-button {
+        position: absolute;
+        top: 80px; /* Position below other controls */
+        left: 10px;
+        z-index: 1000;
+        padding: 6px 10px;
+        font-size: 12px;
+        background-color: rgba(40, 44, 52, 0.7);
+        color: #ccc;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        cursor: pointer;
+        opacity: 0.8;
+        transition: background-color 0.2s ease, opacity 0.2s ease;
+      }
+      .area-select-toggle-button:hover {
+        background-color: rgba(60, 64, 72, 0.8);
+        opacity: 1;
+      }
+      .area-select-toggle-button.active {
+        background-color: #3498db;
+        color: white;
+        border-color: rgba(255, 255, 255, 0.4);
+        opacity: 1;
+      }
+    `;
+    document.head.appendChild(style);
+
+    // Cleanup function to remove the style when the component unmounts
+    return () => {
+      const existingStyle = document.getElementById(styleId);
+      if (existingStyle) {
+        document.head.removeChild(existingStyle);
+      }
+    };
+  }, []); // Run only once on mount
+
+  // Function to toggle area selection mode
+  const toggleAreaSelectionMode = () => {
+    setIsAreaSelectionMode(prev => !prev);
+    // Clear previous selection results when toggling mode
+    setSelectedBounds(null);
+    setDensityData(null);
+    setDensityError(null);
+    // Remove the density rectangle if it exists
+    if (densityRectangleRef.current && mapRef.current) {
+        try {
+            mapRef.current.removeLayer(densityRectangleRef.current);
+        } catch (e) {
+             console.warn("Could not remove density rectangle on toggle:", e);
+        }
+        densityRectangleRef.current = null;
+    }
+  };
 
   // JSX rendering the map and its layers/controls
   return (
@@ -432,8 +742,18 @@ const MapComponent = ({
         </div>
       )}
 
+      {/* Area Selection Toggle Button */}
+      <button
+        className={`area-select-toggle-button ${isAreaSelectionMode ? 'active' : ''}`}
+        onClick={toggleAreaSelectionMode}
+        title={isAreaSelectionMode ? "Disable Area Selection" : "Enable Area Selection (Drag on Map)"}
+      >
+        {isAreaSelectionMode ? 'Selecting Area' : 'Select Area'}
+      </button>
+
       {/* Leaflet Map Container */}
       <MapContainer
+        ref={mapRef} // Assign ref to MapContainer
         center={initialPosition}
         zoom={initialZoom}
         minZoom={3} // Set a minimum zoom level
@@ -468,11 +788,44 @@ const MapComponent = ({
             selectedParam={selectedParam}
             onLocationDataLoaded={onLocationSelect} // Pass the callback down
         />
+
+        {/* Component to handle area selection - pass isEnabled state */}
+        <AreaSelectorHandler
+            onBoundsSelected={handleBoundsSelected}
+            isEnabled={isAreaSelectionMode}
+        />
+
       </MapContainer>
+
+      {/* Density Display Panel - Show only when bounds are selected or loading/error occurs */}
+      {(selectedBounds || isDensityLoading || densityError) && (
+        <div className="density-display-panel">
+          <h4>Area Density</h4>
+          {isDensityLoading && <div className="loading">Loading density data...</div>}
+          {densityError && <div className="error">Error: {densityError}</div>}
+          {!isDensityLoading && !densityError && densityData && densityData.count > 0 && (
+            <div>
+              {/* Display average values - adjust parameters as needed based on API response */}
+              {Object.entries(densityData.average_values || {}).map(([param, value]) => (
+                <div key={param}>
+                  <strong>{param.toUpperCase()}:</strong>
+                  <span className="param-value">{value !== null ? value.toFixed(2) : 'N/A'}</span>
+                  {/* Add units if available/needed */}
+                  {/* <span className="param-unit">µg/m³</span> */}
+                </div>
+              ))}
+              <div className="data-count">
+                Based on {densityData.count || 0} data points.
+              </div>
+            </div>
+          )}
+          {!isDensityLoading && !densityError && (!densityData || densityData.count === 0) && (
+            <div className="no-data">No density data available for the selected area.</div>
+          )}
+        </div>
+      )}
     </>
   );
 };
-
-
 
 export default MapComponent;

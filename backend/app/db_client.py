@@ -388,7 +388,7 @@ def calculate_geohashes_for_bbox(min_lat, max_lat, min_lon, max_lon, precision) 
     """
     Calculates a list of geohash prefixes of the given precision
     that cover the bounding box.
-    Uses a recursive approach for better coverage. (FIXED)
+    Uses a recursive approach for better coverage. (FIXED AGAIN - Recursion Logic)
     """
     try:
         import geohash
@@ -396,49 +396,53 @@ def calculate_geohashes_for_bbox(min_lat, max_lat, min_lon, max_lon, precision) 
         logger.warning("Geohash library not available for bbox calculation.")
         raise # Re-raise so the caller knows it failed
 
-    checked_hashes: Set[str] = set()
+    checked_hashes: Set[str] = set() # Keep track of hashes already processed to prevent re-work
     hashes_in_bbox: Set[str] = set()
 
     def check_hash(h: str):
-        if h in checked_hashes: return
+        # Avoid redundant checks and potential cycles (though cycles less likely with pure subdivision)
+        if h in checked_hashes:
+            return
         checked_hashes.add(h)
-        try: gh_bbox = geohash.bbox(h)
+
+        try:
+            gh_bbox = geohash.bbox(h)
         except Exception as e:
-            # This can happen for invalid hash strings during recursion, log quietly
             logger.debug(f"Could not decode geohash '{h}' during bbox check: {e}")
             return
 
         hash_min_lat, hash_max_lat = gh_bbox['s'], gh_bbox['n']
         hash_min_lon, hash_max_lon = gh_bbox['w'], gh_bbox['e']
+
+        # Check for intersection between the geohash's bbox and the target bbox
         intersects = (hash_min_lat <= max_lat and hash_max_lat >= min_lat and
                       hash_min_lon <= max_lon and hash_max_lon >= min_lon)
-        if not intersects: return
 
+        if not intersects:
+            return # This geohash (and its subdivisions) are outside the target area
+
+        # If the hash is at the target precision and intersects, add it
         if len(h) == precision:
             hashes_in_bbox.add(h)
             return
 
+        # If the hash intersects and is shorter than the target precision, subdivide and recurse
         if len(h) < precision:
-            # Check neighbors and subdivide
-            neighbors = geohash.neighbors(h)
-            # *** FIX: Use the manually defined GEOHASH_BASE32_CHARS ***
-            all_to_check = list(neighbors) + [h + char for char in GEOHASH_BASE32_CHARS]
-            for next_h in all_to_check:
-                 # Optimization: check length before recursive call
-                 if len(next_h) <= precision:
-                    check_hash(next_h)
+            # *** FIX: Only subdivide the current hash, do not check neighbors here ***
+            for char in GEOHASH_BASE32_CHARS:
+                next_h = h + char
+                # No need to check length again, it will be checked in the recursive call
+                check_hash(next_h)
 
-    # Start check from a few points
+    # Start check from a few points (same logic as before)
     initial_hashes = set()
     points_to_encode = [
         ( (min_lat + max_lat) / 2, (min_lon + max_lon) / 2 ), # Center
         (min_lat, min_lon), (min_lat, max_lon), (max_lat, min_lon), (max_lat, max_lon) # Corners
     ]
-    # Start coarse, but not too coarse to miss details in small target precisions
     start_precision = min(precision, 4) if precision > 1 else 1
     for p_lat, p_lon in points_to_encode:
         try:
-            # Ensure coordinates are valid before encoding
             if -90 <= p_lat <= 90 and -180 <= p_lon <= 180:
                 initial_hashes.add(geohash.encode(p_lat, p_lon, precision=start_precision))
             else:
@@ -446,9 +450,8 @@ def calculate_geohashes_for_bbox(min_lat, max_lat, min_lon, max_lon, precision) 
         except Exception as e: logger.warning(f"Could not encode initial point {p_lat},{p_lon}: {e}")
 
     if not initial_hashes:
-        # This might happen if the input bbox itself is invalid or extremely small
         logger.error(f"Could not generate any initial geohashes for bbox check: [{min_lat},{min_lon} to {max_lat},{max_lon}]")
-        # Attempt a single geohash at the target precision from the center as a last resort
+        # Fallback logic remains the same
         try:
              center_lat = (min_lat + max_lat) / 2
              center_lon = (min_lon + max_lon) / 2
@@ -458,9 +461,11 @@ def calculate_geohashes_for_bbox(min_lat, max_lat, min_lon, max_lon, precision) 
                  return [center_hash]
         except Exception:
              logger.error("Failed fallback to single center hash.")
-             return [] # Truly failed
+             return []
 
-    for h in initial_hashes: check_hash(h)
+    # Start the recursive check for each initial hash
+    for h in initial_hashes:
+        check_hash(h)
 
     result = list(hashes_in_bbox)
     logger.debug(f"Calculated {len(result)} geohash prefixes for bbox with precision {precision}")

@@ -1,0 +1,28 @@
+/* frontend/src/components/MapComponent.css */
+
+/* Add styles for MapComponent here */
+
+.map-loading-indicator,
+.map-error-indicator {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: rgba(40, 44, 52, 0.85);
+    color: white;
+    padding: 5px 15px;
+    border-radius: 4px;
+    z-index: 1100; /* High z-index */
+    font-size: 0.9em;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+.map-error-indicator {
+    background-color: rgba(220, 53, 69, 0.85); /* Red background for errors */
+}
+
+/* Style for the density panel 'no-data' message */
+.density-display-panel .no-data {
+    font-style: italic;
+    color: #aaa;
+}

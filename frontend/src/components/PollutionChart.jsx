@@ -1,65 +1,136 @@
 // frontend/src/components/PollutionChart.jsx
 import React from 'react';
-import './PollutionChart.css'; // We'll add some basic CSS
+import { Bar } from 'react-chartjs-2';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  Tooltip,
+  Legend,
+} from 'chart.js';
+import './PollutionChart.css';
 
-// Define approximate max values for scaling bars (can be adjusted based on AQI levels)
-// Units are typically µg/m³
-const POLLUTANT_MAX_VALUES = {
-  pm25: 100, // Example max for PM2.5
-  no2: 80,   // Example max for NO2
-  o3: 120,   // Example max for O3
+// Register Chart.js components
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  Tooltip,
+  Legend
+);
+
+// Define colors for various pollutants
+const POLLUTANT_COLORS = {
+  pm25: 'rgba(138, 43, 226, 0.7)', // Purple
+  no2: 'rgba(76, 175, 80, 0.7)',  // Green
+  o3: 'rgba(255, 193, 7, 0.7)',   // Amber
+  pm10: 'rgba(255, 99, 132, 0.7)', // Pink/Red
+  so2: 'rgba(54, 162, 235, 0.7)', // Blue
+  co: 'rgba(153, 102, 255, 0.7)', // Indigo
 };
 
-// Define colors (can be expanded for AQI levels)
-const POLLUTANT_COLORS = {
-  pm25: '#8a2be2', // Purple
-  no2: '#4CAF50',  // Green
-  o3: '#ffc107',   // Amber
+const POLLUTANT_BORDER_COLORS = {
+  pm25: 'rgba(138, 43, 226, 1)',
+  no2: 'rgba(76, 175, 80, 1)',
+  o3: 'rgba(255, 193, 7, 1)',
+  pm10: 'rgba(255, 99, 132, 1)',
+  so2: 'rgba(54, 162, 235, 1)',
+  co: 'rgba(153, 102, 255, 1)',
+};
+
+// Mapping for display names
+const POLLUTANT_NAMES = {
+    pm25: 'PM 2.5',
+    no2: 'NO₂',
+    o3: 'O₃',
+    pm10: 'PM 10',
+    so2: 'SO₂',
+    co: 'CO',
 };
 
 const PollutionChart = ({ pollutionData }) => {
-  // Helper function to render a single pollutant line with a bar
-  const renderPollutantLine = (pollutantKey, label, unit) => {
-    const value = pollutionData ? pollutionData[pollutantKey] : null;
-    const maxValue = POLLUTANT_MAX_VALUES[pollutantKey];
-    const color = POLLUTANT_COLORS[pollutantKey];
 
-    // Calculate bar width percentage, handle null/undefined/zero values
-    let barWidthPercent = 0;
-    if (value !== null && value !== undefined && maxValue > 0 && value > 0) {
-      barWidthPercent = Math.min((value / maxValue) * 100, 100); // Cap at 100%
-    }
+  // Dynamically generate chart data based on available pollutants
+  const availablePollutants = pollutionData
+    ? Object.keys(pollutionData).filter(key =>
+        POLLUTANT_NAMES[key] && pollutionData[key] !== null && pollutionData[key] !== undefined
+      )
+    : [];
 
-    const displayValue = (value !== null && value !== undefined)
-      ? value.toFixed(1) // Format to one decimal place
-      : 'N/A'; // Display 'N/A' if data is missing
+  const chartLabels = availablePollutants.map(key => POLLUTANT_NAMES[key]);
+  const chartValues = availablePollutants.map(key => pollutionData[key] ?? 0);
+  const backgroundColors = availablePollutants.map(key => POLLUTANT_COLORS[key] || 'rgba(201, 203, 207, 0.7)'); // Default grey
+  const borderColors = availablePollutants.map(key => POLLUTANT_BORDER_COLORS[key] || 'rgba(201, 203, 207, 1)');
 
-    return (
-      <div className="chart-line" key={pollutantKey}>
-        <div className="chart-label">{label}</div>
-        <div className="chart-visual">
-          <svg width="100%" height="20" viewBox="0 0 100 20" preserveAspectRatio="none">
-            {/* Background bar (optional) */}
-            <rect x="0" y="5" width="100%" height="10" fill="#e0e0e0" rx="3" ry="3" />
-            {/* Data bar */}
-            {barWidthPercent > 0 && (
-               <rect
-                 x="0"
-                 y="5"
-                 width={`${barWidthPercent}%`}
-                 height="10"
-                 fill={color}
-                 rx="3" // Rounded corners
-                 ry="3"
-               />
-            )}
-          </svg>
-        </div>
-        <div className="chart-value">
-          {displayValue} <span className="chart-unit">{unit}</span>
-        </div>
-      </div>
-    );
+  const chartData = {
+    labels: chartLabels,
+    datasets: [
+      {
+        label: 'Concentration (µg/m³)', // This label might not be shown if legend is off
+        data: chartValues,
+        backgroundColor: backgroundColors,
+        borderColor: borderColors,
+        borderWidth: 1,
+      },
+    ],
+  };
+
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        display: false,
+      },
+      title: {
+        display: false,
+      },
+      tooltip: {
+        backgroundColor: 'rgba(0, 0, 0, 0.8)', // Dark tooltip
+        titleColor: '#fff',
+        bodyColor: '#fff',
+        callbacks: {
+          label: function(context) {
+            let label = context.dataset.label || '';
+            if (label) {
+              label += ': ';
+            }
+            if (context.parsed.y !== null) {
+              // Assuming all these pollutants use µg/m³
+              label += context.parsed.y.toFixed(1) + ' µg/m³';
+            }
+            return label;
+          }
+        }
+      }
+    },
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: {
+          display: true,
+          text: 'Concentration (µg/m³)',
+          color: '#ccc', // Light color for axis title
+        },
+        ticks: {
+          color: '#ccc', // Light color for axis labels (ticks)
+        },
+        grid: {
+          color: 'rgba(204, 204, 204, 0.2)', // Lighter grid lines for dark mode
+        },
+      },
+      x: {
+         ticks: {
+             color: '#ccc', // Light color for axis labels (ticks)
+         },
+         grid: {
+             display: false // Keep vertical grid lines hidden
+         }
+      }
+    },
   };
 
   return (
@@ -76,15 +147,16 @@ const PollutionChart = ({ pollutionData }) => {
          )}
       </div>
 
-      <div className="pollution-charts">
-        {renderPollutantLine('pm25', 'PM 2.5', 'µg/m³')}
-        {renderPollutantLine('no2', 'NO₂', 'µg/m³')}
-        {renderPollutantLine('o3', 'O₃', 'µg/m³')}
-        {/* Add other pollutants if needed and available in your data */}
-        {/* e.g., renderPollutantLine('pm10', 'PM 10', 'µg/m³') */}
-        {/* e.g., renderPollutantLine('co', 'CO', 'µg/m³') */}
-        {/* e.g., renderPollutantLine('so2', 'SO₂', 'µg/m³') */}
+      <div className="pollution-chart-container">
+        {pollutionData && availablePollutants.length > 0 ? (
+            <Bar options={chartOptions} data={chartData} />
+        ) : (
+            <div className="no-chart-data">
+                {pollutionData ? 'No pollutant data to display.' : 'Select a location on the map to see details.'}
+            </div>
+        )}
       </div>
+
        {pollutionData?.geohash && (
           <div className="location-info">
               Geohash: {pollutionData.geohash} ({pollutionData.latitude?.toFixed(4)}, {pollutionData.longitude?.toFixed(4)})
