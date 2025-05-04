@@ -96,6 +96,38 @@ export const fetchAnomalies = async (startTime = null, endTime = null) => {
   return handleResponse(response);
 };
 
+// --- NEW: Fetch Location History ---
+/**
+ * Fetches historical air quality data for a specific location (geohash) and parameter.
+ * @param {string} geohash The geohash representing the location.
+ * @param {string} parameter The pollution parameter (e.g., 'pm25', 'no2').
+ * @param {string} window Time window (e.g., '24h', '7d').
+ * @param {string} aggregate Aggregation interval (e.g., '10m', '1h').
+ * @returns {Promise<HistoricalDataPoint[]>} Array of { timestamp, value } objects.
+ */
+export const fetchLocationHistory = async (geohash, parameter, window = '24h', aggregate = '1h') => {
+  if (!geohash || !parameter) {
+    console.error("Geohash and parameter are required for fetching history.");
+    return []; // Return empty array if required params are missing
+  }
+  const params = new URLSearchParams({
+    parameter: parameter,
+    window: window,
+    aggregate: aggregate
+  });
+
+  console.log(`API: Fetching history for ${parameter} at ${geohash} with params: ${params.toString()}`);
+  const response = await fetch(`${API_BASE_URL}/air_quality/location_history/${geohash}?${params.toString()}`);
+  // Handle potential errors more gracefully for history, maybe return empty array
+  try {
+      return await handleResponse(response);
+  } catch (error) {
+      console.error(`API: Failed to fetch history for ${parameter} at ${geohash}:`, error);
+      return []; // Return empty array on fetch error
+  }
+};
+
+
 // Fetch pollution density for a specific bounding box region
 export const fetchPollutionDensity = async (minLat, maxLat, minLon, maxLon, window = '24h') => {
   const params = new URLSearchParams({

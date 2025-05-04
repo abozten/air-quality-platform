@@ -41,7 +41,7 @@
 
 .pollution-chart-container {
   position: relative;
-  height: 200px;
+  height: 280px; /* Slightly larger maybe */
   width: 100%;
   margin-bottom: 15px;
 }
@@ -52,7 +52,7 @@
   align-items: center;
   height: 100%;
   /* Lighter color for placeholder text */
-  color: #888;
+  color: #aaa;
   font-style: italic;
 }
 
@@ -65,4 +65,40 @@
   /* Lighter border */
   border-top: 1px solid #444;
   text-align: center;
+}
+
+/* Add styles for the history chart container */
+.location-history-chart-container {
+  height: 250px; /* Adjust height as needed */
+  width: 100%;
+  margin-bottom: 20px; /* Space between history charts */
+  padding: 10px;
+  background-color: #282c34; /* Match panel background */
+  border-radius: 5px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.history-charts-section {
+  margin-top: 20px;
+  padding-top: 15px;
+  border-top: 1px solid #444; /* Separator line */
+}
+
+.history-charts-section h4 {
+  margin-bottom: 15px;
+  color: #eee;
+  text-align: center;
+}
+
+.error-message {
+  color: #ff6b6b; /* Light red for errors */
+  font-size: 0.9em;
+  text-align: center;
+  margin: 5px 0;
+}
+
+/* Ensure the side panel can scroll if content overflows */
+.side-panel {
+  overflow-y: auto; /* Add vertical scroll */
+  max-height: calc(100vh - 60px); /* Adjust based on header height */
 }

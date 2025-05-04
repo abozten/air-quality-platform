@@ -13,6 +13,7 @@
     "@turf/helpers": "^7.2.0",
     "@turf/interpolate": "^7.2.0",
     "chart.js": "^4.4.9",
+    "chartjs-adapter-date-fns": "^3.0.0",
     "leaflet": "^1.9.4",
     "leaflet.heat": "^0.2.0",
     "leaflet.markercluster": "^1.5.3",
