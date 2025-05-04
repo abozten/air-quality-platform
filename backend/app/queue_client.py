@@ -207,6 +207,70 @@ async def publish_message_async(message_body: dict):
     logger.error(f"Failed to publish message after {retries} attempts. Last error: {last_exception}")
     return False
 
+# --- NEW Publish Function for Broadcasts (using the pool) ---
+async def publish_broadcast_message_async(message_body: dict):
+    """Publishes a message to the broadcast fanout exchange using the pool."""
+    retries = 2
+    last_exception = None
+    exchange_name = settings.rabbitmq_exchange_broadcast
+
+    for attempt in range(retries):
+        try:
+            async with connection_pool.acquire() as connection:
+                try:
+                    channel = await connection.channel()
+                    logger.debug(f"Broadcast Channel created (id: {channel.number})")
+                except Exception as channel_error:
+                    logger.error(f"Failed to create broadcast channel: {channel_error}", exc_info=True)
+                    last_exception = channel_error
+                    continue
+
+                # Declare the fanout exchange (idempotent)
+                try:
+                    exchange = await channel.declare_exchange(
+                        exchange_name,
+                        aio_pika.ExchangeType.FANOUT,
+                        durable=True # Make exchange durable
+                    )
+                    logger.debug(f"Declared broadcast exchange '{exchange_name}'")
+                except Exception as declare_error:
+                    logger.error(f"Failed to declare broadcast exchange '{exchange_name}': {declare_error}", exc_info=True)
+                    last_exception = declare_error
+                    await channel.close()
+                    continue
+
+                # Publish the message to the fanout exchange (no routing key needed)
+                try:
+                    message = aio_pika.Message(
+                        body=json.dumps(message_body).encode(),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT # Persist if queues are durable
+                    )
+                    await exchange.publish(message, routing_key="") # Empty routing key for fanout
+                    logger.debug(f"Published broadcast message to exchange '{exchange_name}' on channel {channel.number}")
+                    await channel.close()
+                    return True
+
+                except Exception as publish_error:
+                    logger.error(f"Error publishing broadcast message on channel {channel.number}: {publish_error}", exc_info=True)
+                    last_exception = publish_error
+                    await channel.close()
+                    # Fall through to retry logic
+
+        except ConnectionError as conn_err:
+            logger.error(f"Attempt {attempt + 1}/{retries}: Failed to acquire connection for broadcast: {conn_err}")
+            last_exception = conn_err
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1}/{retries}: Unexpected error during broadcast publish: {e}", exc_info=True)
+            last_exception = e
+
+        if attempt < retries - 1:
+            wait_time = 1 * (attempt + 1)
+            logger.info(f"Retrying broadcast publish in {wait_time}s...")
+            await asyncio.sleep(wait_time)
+
+    logger.error(f"Failed to publish broadcast message after {retries} attempts. Last error: {last_exception}")
+    return False
+
 # --- Lifespan Integration Functions ---
 async def initialize_rabbitmq_pool():
     """Called during FastAPI startup."""

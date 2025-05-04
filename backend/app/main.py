@@ -7,6 +7,9 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 import logging
+import asyncio
+import aio_pika
+import json
 from fastapi import FastAPI, Query, HTTPException, Body, status, WebSocket, WebSocketDisconnect
 from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint
 from .db_client import (
@@ -18,8 +21,8 @@ from .db_client import (
     write_air_quality_data
 )
 from . import db_client # Keep for close_influx_client call
-from . import queue_client
-from . import websocket_manager # Import WebSocket manager
+from . import queue_client # Import queue_client for publishing and consuming
+from . import websocket_manager # Import WebSocket manager (used locally now)
 from .aggregation import aggregate_by_geohash # Import aggregation function
 from .config import get_settings # Import get_settings
 
@@ -29,15 +32,130 @@ settings = get_settings() # Get settings instance
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- RabbitMQ Consumer Task for WebSocket Broadcasts ---
+rabbitmq_consumer_task = None
+rabbitmq_connection = None
+rabbitmq_channel = None
+
+async def consume_broadcasts():
+    """Connects to RabbitMQ, declares exclusive queue, binds to fanout, and consumes."""
+    global rabbitmq_connection, rabbitmq_channel
+    loop = asyncio.get_running_loop()
+    settings = get_settings() # Get settings inside the async function
+    RABBITMQ_URL = f"amqp://{settings.rabbitmq_user}:{settings.rabbitmq_pass}@{settings.rabbitmq_host}:{settings.rabbitmq_port}/"
+    BROADCAST_EXCHANGE = settings.rabbitmq_exchange_broadcast
+
+    while True: # Keep trying to connect/reconnect
+        try:
+            logger.info("BROADCAST_CONSUMER: Attempting connection to RabbitMQ...")
+            rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL, loop=loop, timeout=15)
+            logger.info("BROADCAST_CONSUMER: Connection established.")
+
+            rabbitmq_channel = await rabbitmq_connection.channel()
+            logger.info("BROADCAST_CONSUMER: Channel created.")
+
+            # Declare the fanout exchange (idempotent)
+            exchange = await rabbitmq_channel.declare_exchange(
+                BROADCAST_EXCHANGE, aio_pika.ExchangeType.FANOUT, durable=True
+            )
+            logger.info(f"BROADCAST_CONSUMER: Declared fanout exchange '{BROADCAST_EXCHANGE}'.")
+
+            # Declare an exclusive, auto-delete queue for this instance
+            # Empty name means RabbitMQ generates a unique one
+            queue = await rabbitmq_channel.declare_queue(name='', exclusive=True, auto_delete=True)
+            logger.info(f"BROADCAST_CONSUMER: Declared exclusive queue '{queue.name}'.")
+
+            # Bind the exclusive queue to the fanout exchange
+            await queue.bind(exchange)
+            logger.info(f"BROADCAST_CONSUMER: Bound queue '{queue.name}' to exchange '{BROADCAST_EXCHANGE}'.")
+
+            logger.info(f"BROADCAST_CONSUMER: Waiting for broadcast messages on queue '{queue.name}'...")
+
+            async def on_message(message: aio_pika.IncomingMessage):
+                async with message.process(ignore_processed=True): # Auto-ack on success
+                    try:
+                        logger.debug(f"BROADCAST_CONSUMER: Received message on '{queue.name}'.")
+                        body = message.body.decode()
+                        anomaly_data = json.loads(body)
+                        # Validate if it looks like an anomaly (basic check)
+                        if isinstance(anomaly_data, dict) and 'id' in anomaly_data and 'parameter' in anomaly_data:
+                            # Re-create Anomaly object (optional, could just pass dict)
+                            anomaly = Anomaly(**anomaly_data)
+                            logger.info(f"BROADCAST_CONSUMER: Broadcasting anomaly {anomaly.id} received from queue.")
+                            # Use the LOCAL websocket manager instance to broadcast
+                            await websocket_manager.manager.broadcast_anomaly(anomaly)
+                        else:
+                            logger.warning(f"BROADCAST_CONSUMER: Received non-anomaly message: {body[:100]}...")
+                    except json.JSONDecodeError:
+                        logger.error("BROADCAST_CONSUMER: Failed to decode JSON message.", exc_info=True)
+                    except Exception as e:
+                        logger.error(f"BROADCAST_CONSUMER: Error processing message: {e}", exc_info=True)
+
+            # Start consuming
+            await queue.consume(on_message)
+
+            # Keep consumer running until connection breaks or shutdown
+            await asyncio.Future() # Wait indefinitely
+
+        except (aio_pika.exceptions.AMQPConnectionError, ConnectionError, OSError) as e:
+            logger.error(f"BROADCAST_CONSUMER: Connection/AMQP error: {e}. Retrying in 5 seconds...", exc_info=False)
+            if rabbitmq_connection and not rabbitmq_connection.is_closed:
+                try: await rabbitmq_connection.close()
+                except Exception: pass
+            rabbitmq_connection = None
+            rabbitmq_channel = None
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("BROADCAST_CONSUMER: Task cancelled.")
+            break # Exit the loop on cancellation
+        except Exception as e:
+            logger.error(f"BROADCAST_CONSUMER: An unexpected error occurred: {e}", exc_info=True)
+            if rabbitmq_connection and not rabbitmq_connection.is_closed:
+                try: await rabbitmq_connection.close()
+                except Exception: pass
+            rabbitmq_connection = None
+            rabbitmq_channel = None
+            logger.info("BROADCAST_CONSUMER: Restarting consumer loop after 10 seconds...")
+            await asyncio.sleep(10)
+        finally:
+            logger.info("BROADCAST_CONSUMER: Cleaning up connection/channel...")
+            if rabbitmq_channel and not rabbitmq_channel.is_closed:
+                try: await rabbitmq_channel.close()
+                except Exception: pass
+            if rabbitmq_connection and not rabbitmq_connection.is_closed:
+                try: await rabbitmq_connection.close()
+                except Exception: pass
+            rabbitmq_connection = None
+            rabbitmq_channel = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global rabbitmq_consumer_task
     logger.info("API Startup: Initializing resources...")
-    # Initialize RabbitMQ connection pool
+    # Initialize RabbitMQ connection pool (for publishing)
     await queue_client.initialize_rabbitmq_pool()
-    # Initialize other resources if needed (e.g., check InfluxDB connection again)
-    yield
+
+    # Start the RabbitMQ broadcast consumer in the background
+    logger.info("API Startup: Starting RabbitMQ broadcast consumer task...")
+    loop = asyncio.get_running_loop()
+    rabbitmq_consumer_task = loop.create_task(consume_broadcasts())
+
+    yield # API is running
+
     logger.info("API Shutdown: Cleaning up resources...")
-    # Close RabbitMQ connection pool
+    # Stop the RabbitMQ broadcast consumer task
+    if rabbitmq_consumer_task and not rabbitmq_consumer_task.done():
+        logger.info("API Shutdown: Cancelling RabbitMQ broadcast consumer task...")
+        rabbitmq_consumer_task.cancel()
+        try:
+            await rabbitmq_consumer_task # Wait for cancellation
+        except asyncio.CancelledError:
+            logger.info("API Shutdown: RabbitMQ broadcast consumer task cancelled successfully.")
+        except Exception as e:
+            logger.error(f"API Shutdown: Error during broadcast consumer task cancellation: {e}", exc_info=True)
+
+    # Close RabbitMQ connection pool (for publishing)
     await queue_client.close_rabbitmq_pool()
     # Close InfluxDB connection (synchronous)
     db_client.close_influx_client()
@@ -373,16 +491,16 @@ async def websocket_endpoint(websocket: WebSocket):
 # --- Test Endpoint for WebSocket Anomaly Broadcast ---
 @app.post(
     f"{API_PREFIX}/test/broadcast-anomaly",
-    summary="Test Anomaly Broadcast",
-    description="Creates a test anomaly and broadcasts it via WebSockets for testing purposes."
+    summary="Test Anomaly Broadcast via RabbitMQ",
+    description="Creates a test anomaly and publishes it to the RabbitMQ broadcast exchange for testing distributed WebSocket delivery."
 )
 async def test_anomaly_broadcast():
     """
-    Creates a test anomaly and broadcasts it to all connected WebSocket clients.
-    This is useful for debugging the WebSocket broadcast functionality.
+    Creates a test anomaly and publishes it to the RabbitMQ fanout exchange.
+    All connected API instances should receive this via their consumer and broadcast locally.
     """
-    logger.info("Creating and broadcasting test anomaly")
-    
+    logger.info("API: Creating and publishing test anomaly to broadcast exchange")
+
     # Create a test anomaly
     import uuid
     test_anomaly = Anomaly(
@@ -392,17 +510,22 @@ async def test_anomaly_broadcast():
         timestamp=datetime.now(timezone.utc),
         parameter="pm25",
         value=180.5,
-        description="TEST ANOMALY - High PM2.5 level detected in Antalya"
+        description="TEST ANOMALY - High PM2.5 level detected in Antalya (via RabbitMQ)"
     )
-    
-    # Broadcast the test anomaly
+
+    # Publish the test anomaly to the broadcast exchange
     try:
-        await websocket_manager.broadcast_anomaly(test_anomaly)
-        logger.info(f"Test anomaly broadcast successful")
-        return {"message": "Test anomaly broadcast successful", "anomaly_id": test_anomaly.id}
+        # Use the specific broadcast publish function
+        success = await queue_client.publish_broadcast_message_async(test_anomaly.model_dump(mode='json'))
+        if success:
+            logger.info(f"API: Test anomaly {test_anomaly.id} published to broadcast exchange successfully.")
+            return {"message": "Test anomaly published to broadcast exchange", "anomaly_id": test_anomaly.id}
+        else:
+            logger.error(f"API: FAILED to publish test anomaly {test_anomaly.id} to broadcast exchange.")
+            raise HTTPException(status_code=503, detail="Failed to publish test anomaly to broadcast exchange.")
     except Exception as e:
-        logger.error(f"Failed to broadcast test anomaly: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to broadcast test anomaly: {str(e)}")
+        logger.error(f"API: Error publishing test anomaly: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error publishing test anomaly: {str(e)}")
 
 # --- Basic Root Endpoint ---
 @app.get("/", summary="Root Endpoint", description="Basic API information.")

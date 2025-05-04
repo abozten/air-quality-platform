@@ -17,7 +17,10 @@ try:
     from .models import AirQualityReading, IngestRequest, Anomaly
     from . import db_client # Keep sync DB client for now
     from . import anomaly_detection # Keep sync anomaly detection
-    from . import websocket_manager # Import WebSocket manager for broadcasting anomalies
+    # Remove direct import of websocket_manager, worker no longer broadcasts directly
+    # from . import websocket_manager
+    # Import the specific publish function needed
+    from .queue_client import publish_broadcast_message_async, connection_pool, initialize_rabbitmq_pool, close_rabbitmq_pool
 except ImportError as e:
      logger.error(f"Failed to import necessary modules. Ensure structure is correct. Error: {e}")
      sys.exit(1)
@@ -108,13 +111,18 @@ async def process_message(message: aio_pika.IncomingMessage):
                 else:
                     logger.debug("WORKER: Non-blocking anomaly write successful.")
 
-                # 4.4. Broadcast anomaly via WebSocket
-                logger.debug("WORKER: Broadcasting anomaly via WebSocket...")
+                # 4.4. Publish anomaly to RabbitMQ Fanout Exchange for broadcasting
+                logger.debug("WORKER: Publishing anomaly to broadcast exchange...")
                 try:
-                    await websocket_manager.broadcast_anomaly(anomaly)
-                    logger.info("WORKER: Anomaly broadcast successful.")
-                except Exception as ws_error:
-                    logger.error(f"WORKER: Failed to broadcast anomaly {anomaly.id} via WebSocket. Error: {ws_error}", exc_info=True)
+                    # Use the new publish function for the fanout exchange
+                    broadcast_success = await publish_broadcast_message_async(anomaly.model_dump(mode='json'))
+                    if broadcast_success:
+                        logger.info(f"WORKER: Anomaly {anomaly.id} published to broadcast exchange successfully.")
+                    else:
+                        # Log error but don't fail processing just for broadcast failure
+                        logger.error(f"WORKER: Failed to publish anomaly {anomaly.id} to broadcast exchange.")
+                except Exception as pub_error:
+                    logger.error(f"WORKER: Error publishing anomaly {anomaly.id} to broadcast exchange: {pub_error}", exc_info=True)
             else:
                 logger.debug("WORKER: No threshold anomalies detected (non-blocking check).")
 
@@ -195,6 +203,10 @@ async def start_consuming(loop):
 
 async def main():
     """Main async function to start the consumer."""
+    logger.info("WORKER: Initializing RabbitMQ connection pool...")
+    await initialize_rabbitmq_pool() # Initialize the pool for the worker
+    logger.info("WORKER: RabbitMQ connection pool initialized.")
+
     loop = asyncio.get_running_loop()
     consumer_task = loop.create_task(start_consuming(loop))
 
@@ -232,6 +244,19 @@ if __name__ == "__main__":
         logger.info("WORKER: KeyboardInterrupt received in main.")
     finally:
         logger.info("WORKER: Cleaning up resources...")
+        # Close RabbitMQ pool connections
+        logger.info("WORKER: Closing RabbitMQ connection pool...")
+        # Run the async close function in a new event loop if the main one is stopped
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.run_until_complete(close_rabbitmq_pool())
+            else:
+                asyncio.run(close_rabbitmq_pool())
+            logger.info("WORKER: RabbitMQ connection pool closed.")
+        except Exception as e:
+            logger.error(f"WORKER: Error closing RabbitMQ pool: {e}", exc_info=True)
+
         # Close InfluxDB connection (still synchronous, called after event loop stops)
         db_client.close_influx_client()
         logger.info("WORKER: Async Air Quality Worker finished.")

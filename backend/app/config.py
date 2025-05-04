@@ -20,7 +20,9 @@ class Settings(BaseSettings):
     # Explicitly map the settings field to the environment variable name
     rabbitmq_user: str = Field("guest", alias="RABBITMQ_DEFAULT_USER")
     rabbitmq_pass: str = Field("guest", alias="RABBITMQ_DEFAULT_PASS")
-    rabbitmq_queue_raw: str = "raw_air_quality"
+    rabbitmq_queue_raw: str = "air_quality_raw_data"
+    # Add the new exchange name
+    rabbitmq_exchange_broadcast: str = "websocket_broadcast_fanout"
     
     geohash_precision_storage: int = 5
 
