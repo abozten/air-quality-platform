@@ -8,7 +8,7 @@ from .models import AirQualityReading
 from typing import List, Optional, Set
 import logging
 from datetime import datetime, timedelta, timezone
-from .models import Anomaly, PollutionDensity
+from .models import AirQualityReading, Anomaly, PollutionDensity, TimeSeriesDataPoint # Add TimeSeriesDataPoint
 import json # Needed for query formatting
 from math import radians, cos, sin, sqrt, atan2
 
@@ -694,6 +694,92 @@ def write_air_quality_data(reading: AirQualityReading):
         logger.error(f"Generic error writing data point: {e}", exc_info=True)
         logger.error(f"Failed Point Line Protocol: {point.to_line_protocol()}")
         return False
+
+
+
+
+# --- Query Function for Time Series History ---
+def query_location_history(
+    geohash_str: str,
+    parameter: str, # e.g., 'pm25', 'no2'
+    window: str = "24h",
+    aggregate_window: str = "10m" # How finely to aggregate the data (e.g., every 10 minutes)
+) -> List[TimeSeriesDataPoint]:
+    """
+    Queries historical time series data for a specific parameter within a geohash cell.
+    Aggregates data into time windows (e.g., 10-minute averages).
+    """
+    if not query_api:
+        logger.error("InfluxDB query_api not available for history query.")
+        return []
+    if not geohash:
+        logger.error("Geohash library not available. Cannot perform geohash-based query.")
+        return []
+
+    # Validate parameter
+    valid_parameters = {'pm25', 'pm10', 'no2', 'so2', 'o3', 'co'} # Add 'co' if needed
+    if parameter not in valid_parameters:
+        logger.error(f"Invalid parameter requested for history: {parameter}")
+        return []
+
+    logger.info(f"Querying history for geohash '{geohash_str}', parameter '{parameter}', window '{window}', aggregate '{aggregate_window}'")
+
+    # Construct Flux query
+    flux_query = f'''
+        import "math"
+        import "types"
+
+        from(bucket: "{influx_bucket}")
+          |> range(start: -{window})
+          |> filter(fn: (r) => r["_measurement"] == "air_quality")
+          |> filter(fn: (r) => r["geohash"] == "{geohash_str}") // Filter by the specific geohash tag
+          |> filter(fn: (r) => r["_field"] == "{parameter}") // Filter by the specific parameter field
+          // Ensure values are valid numbers
+          |> filter(fn: (r) => types.isNumeric(v: r._value) and not math.isNaN(f: r._value))
+          // Aggregate into time windows (e.g., calculate the mean every 10 minutes)
+          |> aggregateWindow(every: {aggregate_window}, fn: mean, createEmpty: false)
+          |> yield(name: "mean_values")
+    '''
+    logger.debug(f"Executing Flux query for location history:\\n{flux_query}")
+
+    results: List[TimeSeriesDataPoint] = []
+    try:
+        tables = query_api.query(query=flux_query, org=influx_org)
+
+        if not tables:
+            logger.info(f"No history data found for geohash {geohash_str}, param {parameter}, window {window}.")
+            return []
+
+        for table in tables:
+            for record in table.records:
+                try:
+                    timestamp = record.get_time()
+                    value = record.get_value()
+
+                    if timestamp is not None and value is not None:
+                        results.append(TimeSeriesDataPoint(timestamp=timestamp, value=float(value)))
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Error processing history record: {e} - Record: {record.values}", exc_info=False)
+                except Exception as e:
+                    logger.error(f"Unexpected error processing history record: {e} - Record: {record.values}", exc_info=True)
+
+        # Sort results by timestamp ascending (aggregateWindow might not guarantee order)
+        results.sort(key=lambda dp: dp.timestamp)
+
+        logger.info(f"Retrieved {len(results)} history data points for geohash {geohash_str}, param {parameter}.")
+        return results
+
+    except InfluxDBError as e:
+        logger.error(f"InfluxDB Error querying location history ({geohash_str}, {parameter}): {e}", exc_info=True)
+        if hasattr(e, 'response') and e.response and hasattr(e.response, 'data'):
+             flux_error_msg = e.response.data.decode() if isinstance(e.response.data, bytes) else str(e.response.data)
+             logger.error(f"InfluxDB Response Body: {flux_error_msg}")
+        return []
+    except Exception as e:
+        logger.error(f"Generic error querying location history ({geohash_str}, {parameter}): {e}", exc_info=True)
+        return []
+
+
 
 # --- Example Query Function ---
 def query_latest_location_data(

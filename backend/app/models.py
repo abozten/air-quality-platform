@@ -73,6 +73,11 @@ class PollutionDensity(BaseModel):
     average_o3: Optional[float] = Field(None, example=58.2, description="Average O3 value.")
     data_points_count: int = Field(..., example=150, description="Number of data points used to calculate the averages (represents overall data density).")
 
+# +++ NEW Model for Time Series Data Points +++
+class TimeSeriesDataPoint(BaseModel):
+    timestamp: datetime = Field(..., description="Timestamp for the data point (UTC)")
+    value: float = Field(..., description="Aggregated value at this timestamp")
+
 class AggregatedAirQualityPoint(BaseModel):
     """Response model for a single aggregated point in the /air_quality/points endpoint."""
     geohash: str = Field(..., example="u10hfg", description="Geohash string representing the grid cell.")

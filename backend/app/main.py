@@ -10,13 +10,14 @@ import logging
 import asyncio
 import aio_pika
 import json
-from fastapi import FastAPI, Query, HTTPException, Body, status, WebSocket, WebSocketDisconnect
-from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint
+from fastapi import FastAPI, Query, HTTPException, Body, status, WebSocket, WebSocketDisconnect, Path
+from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint, TimeSeriesDataPoint
 from .db_client import (
     query_latest_location_data,
     query_raw_points_in_bbox,
     query_anomalies_from_db,
     query_density_in_bbox,
+    query_location_history,
     close_influx_client,
     write_air_quality_data
 )
@@ -385,6 +386,55 @@ async def get_air_quality_for_location(
     logger.info(f"Returning latest data found within geohash cell for location {lat},{lon} (precision {geohash_precision}).")
     # The query function returns the Pydantic model directly or None
     return data
+
+
+# --- NEW Endpoint for Location History ---
+@app.get(
+    f"{API_PREFIX}/air_quality/history/{{geohash_str}}/{{parameter}}",
+    response_model=List[TimeSeriesDataPoint],
+    summary="Get Time Series History for a Location and Parameter",
+    description="Retrieves aggregated historical air quality data (e.g., 10-minute averages) for a specific parameter within a given geohash cell over a specified time window."
+)
+async def get_location_history(
+    geohash_str: str = Path(..., description="The geohash string identifying the location cell.", min_length=1, max_length=12),
+    parameter: str = Path(..., description="The pollutant parameter to retrieve history for (e.g., 'pm25', 'no2')."),
+    window: str = Query("24h", description="Time window to fetch history from (e.g., '1h', '24h', '7d'). Format: InfluxDB duration literal."),
+    aggregate: str = Query("10m", description="Aggregation window for the time series (e.g., '1m', '10m', '1h'). Format: InfluxDB duration literal.")
+):
+    """
+    Fetches time series data for a pollutant in a geohash cell.
+    """
+    logger.info(f"Request for history: geohash={geohash_str}, parameter={parameter}, window={window}, aggregate={aggregate}")
+
+    # Basic validation (more specific validation could be added)
+    valid_parameters = {'pm25', 'pm10', 'no2', 'so2', 'o3', 'co'}
+    if parameter not in valid_parameters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parameter '{parameter}'. Valid parameters are: {', '.join(valid_parameters)}"
+        )
+    # Basic geohash validation (can be improved)
+    if not all(c in geohash.geohash.VALID_CHARS for c in geohash_str):
+         raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid geohash string '{geohash_str}'."
+        )
+
+    history_data = query_location_history(
+        geohash_str=geohash_str,
+        parameter=parameter,
+        window=window,
+        aggregate_window=aggregate
+    )
+
+    if not history_data:
+        logger.info(f"No history data found for geohash {geohash_str}, param {parameter}, window {window}.")
+        # Return empty list as per response_model=List[...]
+        return []
+
+    logger.info(f"Returning {len(history_data)} history points for geohash {geohash_str}, param {parameter}.")
+    return history_data
+
 
 # --- POST Endpoint for Ingesting Data ---
 @app.post(
