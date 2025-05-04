@@ -3,6 +3,11 @@
 FROM python:3.13-slim
 
 WORKDIR /app
+# Install build tools needed for C/C++ extensions like python-geohash
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    # Clean up apt cache to reduce image size
+    rm -rf /var/lib/apt/lists/*
 
 # Install build dependencies (gcc, etc.), create python user, then install requirements, then remove build deps
 RUN apt-get update \

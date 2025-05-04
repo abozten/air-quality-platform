@@ -1,33 +1,163 @@
 # backend/app/main.py
 from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
+import random
+import geohash
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 import logging
-from .config import get_settings # Use get_settings() here
-from fastapi import FastAPI, Query, HTTPException, Body, status
-from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity # Import all necessary models
-from . import db_client # Import db_client module
-from . import queue_client # Import queue_client module
+import asyncio
+import aio_pika
+import json
+from fastapi import FastAPI, Query, HTTPException, Body, status, WebSocket, WebSocketDisconnect
+from .models import IngestRequest, AirQualityReading, Anomaly, PollutionDensity, AggregatedAirQualityPoint
+from .db_client import (
+    query_latest_location_data,
+    query_raw_points_in_bbox,
+    query_anomalies_from_db,
+    query_density_in_bbox,
+    close_influx_client,
+    write_air_quality_data
+)
+from . import db_client # Keep for close_influx_client call
+from . import queue_client # Import queue_client for publishing and consuming
+from . import websocket_manager # Import WebSocket manager (used locally now)
+from .aggregation import aggregate_by_geohash # Import aggregation function
+from .config import get_settings # Import get_settings
 
-settings = get_settings() # Get settings
+settings = get_settings() # Get settings instance
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# --- RabbitMQ Consumer Task for WebSocket Broadcasts ---
+rabbitmq_consumer_task = None
+rabbitmq_connection = None
+rabbitmq_channel = None
+
+async def consume_broadcasts():
+    """Connects to RabbitMQ, declares exclusive queue, binds to fanout, and consumes."""
+    global rabbitmq_connection, rabbitmq_channel
+    loop = asyncio.get_running_loop()
+    settings = get_settings() # Get settings inside the async function
+    RABBITMQ_URL = f"amqp://{settings.rabbitmq_user}:{settings.rabbitmq_pass}@{settings.rabbitmq_host}:{settings.rabbitmq_port}/"
+    BROADCAST_EXCHANGE = settings.rabbitmq_exchange_broadcast
+
+    while True: # Keep trying to connect/reconnect
+        try:
+            logger.info("BROADCAST_CONSUMER: Attempting connection to RabbitMQ...")
+            rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL, loop=loop, timeout=15)
+            logger.info("BROADCAST_CONSUMER: Connection established.")
+
+            rabbitmq_channel = await rabbitmq_connection.channel()
+            logger.info("BROADCAST_CONSUMER: Channel created.")
+
+            # Declare the fanout exchange (idempotent)
+            exchange = await rabbitmq_channel.declare_exchange(
+                BROADCAST_EXCHANGE, aio_pika.ExchangeType.FANOUT, durable=True
+            )
+            logger.info(f"BROADCAST_CONSUMER: Declared fanout exchange '{BROADCAST_EXCHANGE}'.")
+
+            # Declare an exclusive, auto-delete queue for this instance
+            # Empty name means RabbitMQ generates a unique one
+            queue = await rabbitmq_channel.declare_queue(name='', exclusive=True, auto_delete=True)
+            logger.info(f"BROADCAST_CONSUMER: Declared exclusive queue '{queue.name}'.")
+
+            # Bind the exclusive queue to the fanout exchange
+            await queue.bind(exchange)
+            logger.info(f"BROADCAST_CONSUMER: Bound queue '{queue.name}' to exchange '{BROADCAST_EXCHANGE}'.")
+
+            logger.info(f"BROADCAST_CONSUMER: Waiting for broadcast messages on queue '{queue.name}'...")
+
+            async def on_message(message: aio_pika.IncomingMessage):
+                async with message.process(ignore_processed=True): # Auto-ack on success
+                    try:
+                        logger.debug(f"BROADCAST_CONSUMER: Received message on '{queue.name}'.")
+                        body = message.body.decode()
+                        anomaly_data = json.loads(body)
+                        # Validate if it looks like an anomaly (basic check)
+                        if isinstance(anomaly_data, dict) and 'id' in anomaly_data and 'parameter' in anomaly_data:
+                            # Re-create Anomaly object (optional, could just pass dict)
+                            anomaly = Anomaly(**anomaly_data)
+                            logger.info(f"BROADCAST_CONSUMER: Broadcasting anomaly {anomaly.id} received from queue.")
+                            # Use the LOCAL websocket manager instance to broadcast
+                            await websocket_manager.manager.broadcast_anomaly(anomaly)
+                        else:
+                            logger.warning(f"BROADCAST_CONSUMER: Received non-anomaly message: {body[:100]}...")
+                    except json.JSONDecodeError:
+                        logger.error("BROADCAST_CONSUMER: Failed to decode JSON message.", exc_info=True)
+                    except Exception as e:
+                        logger.error(f"BROADCAST_CONSUMER: Error processing message: {e}", exc_info=True)
+
+            # Start consuming
+            await queue.consume(on_message)
+
+            # Keep consumer running until connection breaks or shutdown
+            await asyncio.Future() # Wait indefinitely
+
+        except (aio_pika.exceptions.AMQPConnectionError, ConnectionError, OSError) as e:
+            logger.error(f"BROADCAST_CONSUMER: Connection/AMQP error: {e}. Retrying in 5 seconds...", exc_info=False)
+            if rabbitmq_connection and not rabbitmq_connection.is_closed:
+                try: await rabbitmq_connection.close()
+                except Exception: pass
+            rabbitmq_connection = None
+            rabbitmq_channel = None
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("BROADCAST_CONSUMER: Task cancelled.")
+            break # Exit the loop on cancellation
+        except Exception as e:
+            logger.error(f"BROADCAST_CONSUMER: An unexpected error occurred: {e}", exc_info=True)
+            if rabbitmq_connection and not rabbitmq_connection.is_closed:
+                try: await rabbitmq_connection.close()
+                except Exception: pass
+            rabbitmq_connection = None
+            rabbitmq_channel = None
+            logger.info("BROADCAST_CONSUMER: Restarting consumer loop after 10 seconds...")
+            await asyncio.sleep(10)
+        finally:
+            logger.info("BROADCAST_CONSUMER: Cleaning up connection/channel...")
+            if rabbitmq_channel and not rabbitmq_channel.is_closed:
+                try: await rabbitmq_channel.close()
+                except Exception: pass
+            if rabbitmq_connection and not rabbitmq_connection.is_closed:
+                try: await rabbitmq_connection.close()
+                except Exception: pass
+            rabbitmq_connection = None
+            rabbitmq_channel = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global rabbitmq_consumer_task
     logger.info("API Startup: Initializing resources...")
-    # Initialize RabbitMQ connection pool
+    # Initialize RabbitMQ connection pool (for publishing)
     await queue_client.initialize_rabbitmq_pool()
-    # Initialize InfluxDB client (call the init function from db_client)
-    db_client.initialize_influxdb_client()
-    yield
+
+    # Start the RabbitMQ broadcast consumer in the background
+    logger.info("API Startup: Starting RabbitMQ broadcast consumer task...")
+    loop = asyncio.get_running_loop()
+    rabbitmq_consumer_task = loop.create_task(consume_broadcasts())
+
+    yield # API is running
+
     logger.info("API Shutdown: Cleaning up resources...")
-    # Close RabbitMQ connection pool
+    # Stop the RabbitMQ broadcast consumer task
+    if rabbitmq_consumer_task and not rabbitmq_consumer_task.done():
+        logger.info("API Shutdown: Cancelling RabbitMQ broadcast consumer task...")
+        rabbitmq_consumer_task.cancel()
+        try:
+            await rabbitmq_consumer_task # Wait for cancellation
+        except asyncio.CancelledError:
+            logger.info("API Shutdown: RabbitMQ broadcast consumer task cancelled successfully.")
+        except Exception as e:
+            logger.error(f"API Shutdown: Error during broadcast consumer task cancellation: {e}", exc_info=True)
+
+    # Close RabbitMQ connection pool (for publishing)
     await queue_client.close_rabbitmq_pool()
-    # Close InfluxDB connection
+    # Close InfluxDB connection (synchronous)
     db_client.close_influx_client()
     logger.info("Resource cleanup finished.")
 
@@ -39,168 +169,365 @@ app = FastAPI(
     lifespan=lifespan # Add lifespan manager
 )
 
+
 # --- CORS Configuration ---
+# Adjust origins based on your frontend setup
 origins = [
-    "http://localhost:3000",
+    "http://localhost:3000", # Example React default
     "localhost:3000",
-    "http://localhost:5173", # Vite default port
+    "http://localhost:5173", # Example Vite default
     "localhost:5173",
-    # Add other frontend origins if needed
+    "http://127.0.0.1:5173",
+    # Add WebSocket origins
+    "ws://localhost:3000",
+    "ws://localhost:5173", # Add this line for Vite WebSocket
+    "ws://127.0.0.1:5173",
+    # Add production frontend origin here if applicable
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
 )
 
 # --- API Endpoints ---
 API_PREFIX = "/api/v1"
 
-# Note: The provided main.py had a duplicate definition of get_multiple_air_quality_points.
-# I've removed the first (dummy) one and kept/updated the second one to use db_client.
-# Also, the dummy pollution_density endpoint was removed and replaced with the bbox version.
+def zoom_to_geohash_precision_backend(zoom: Optional[int]) -> int:
+    """ Maps map zoom level to backend geohash aggregation precision. """
+    if zoom is None: return 4 # Default if zoom not provided
+    if zoom <= 3: return 2    # Very coarse for world view
+    if zoom <= 5: return 3    # Coarse for continent/country
+    if zoom <= 7: return 4    # Medium for region
+    if zoom <= 10: return 5   # Finer for city/area
+    if zoom <= 13: return 6   # Fine for neighborhood
+    return 7                  # Very fine for street level (max reasonable default)
 
-@app.post(f"{API_PREFIX}/air_quality/ingest", status_code=status.HTTP_202_ACCEPTED)
+
+# --- NEW Endpoint for Heatmap Data ---
+@app.get(
+    f"{API_PREFIX}/air_quality/heatmap_data",
+    response_model=List[AggregatedAirQualityPoint],
+    summary="Get Aggregated Data for Heatmap",
+    description="Retrieves raw air quality readings within the specified bounding box and time window, aggregates them into geohash cells based on the zoom level, and returns the average values suitable for heatmap rendering."
+)
+async def get_heatmap_data(
+    min_lat: float = Query(..., description="Minimum latitude of the bounding box.", ge=-90, le=90),
+    max_lat: float = Query(..., description="Maximum latitude of the bounding box.", ge=-90, le=90),
+    min_lon: float = Query(..., description="Minimum longitude of the bounding box.", ge=-180, le=180),
+    max_lon: float = Query(..., description="Maximum longitude of the bounding box.", ge=-180, le=180),
+    zoom: Optional[int] = Query(None, description="Current map zoom level, used to determine aggregation precision."),
+    window: str = Query("1h", description="Time window to fetch data from (e.g., '1h', '24h', '15m'). Format: InfluxDB duration literal."),
+    # Consider adding a limit parameter for raw points fetched?
+    # raw_point_limit: int = Query(5000, gt=0, le=20000, description="Maximum raw points to fetch before aggregation.")
+):
+    logger.info(f"Request for heatmap data: bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}], zoom={zoom}, window={window}")
+
+    # Basic validation
+    if min_lat >= max_lat or min_lon >= max_lon:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid bounding box coordinates: min values must be less than max values."
+        )
+
+    # 1. Fetch raw points within the bounding box
+    # Using a default limit defined in the db_client function for now
+    raw_readings = query_raw_points_in_bbox(
+        min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon,
+        window=window
+        # limit=raw_point_limit # Pass limit if added as query param
+    )
+
+    if not raw_readings:
+        logger.info("No raw points found in the specified bbox and window.")
+        return []
+
+    # 2. Determine geohash precision for aggregation based on zoom
+    aggregation_precision = zoom_to_geohash_precision_backend(zoom)
+    logger.info(f"Using aggregation precision: {aggregation_precision} for zoom {zoom}")
+
+    # 3. Aggregate the fetched raw points using the calculated precision
+    aggregated_data = aggregate_by_geohash(
+        points=raw_readings,
+        precision=aggregation_precision
+        # No max_cells limit needed here usually, heatmap handles density visually
+    )
+
+    logger.info(f"Returning {len(aggregated_data)} aggregated points for heatmap.")
+    return aggregated_data
+
+
+# --- Endpoint for Aggregated Points (Map View) ---
+@app.get(
+    f"{API_PREFIX}/air_quality/pointsretired",
+    response_model=List[AggregatedAirQualityPoint],
+    summary="Get Aggregated Air Quality Points",
+    description="Retrieves recent air quality readings, aggregates them into geohash grid cells, and returns the average values for each cell. Useful for map visualization."
+)
+
+# --- Endpoint for Anomalies ---
+@app.get(
+    f"{API_PREFIX}/anomalies",
+    response_model=List[Anomaly],
+    summary="List Detected Anomalies",
+    description="Lists anomalies detected and stored in the database within a specified time range. Defaults to the last 24 hours."
+)
+async def list_anomalies(
+    start_time: Optional[datetime] = Query(None, description="Start time for filtering anomalies (ISO 8601 format, e.g., 2023-10-27T10:00:00Z)."),
+    end_time: Optional[datetime] = Query(None, description="End time for filtering anomalies (ISO 8601 format). Defaults to now if start_time is provided.")
+):
+    """
+    Retrieves stored anomaly records. Requires a separate process (like the worker)
+    to detect and write anomalies to the `air_quality_anomalies` measurement.
+    If no time range is provided, defaults to the last 24 hours.
+    """
+    logger.info(f"Request received for anomalies: start={start_time}, end={end_time}")
+
+    now = datetime.now(timezone.utc)
+    # If only start_time is provided, default end_time to now
+    if start_time is not None and end_time is None:
+        end_time = now
+    # If only end_time is provided, default start_time to 24h before end_time
+    elif start_time is None and end_time is not None:
+        start_time = end_time - timedelta(hours=24)
+
+    # Add timezone info if naive (assume UTC for query consistency)
+    if start_time and start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=timezone.utc)
+    if end_time and end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+
+    anomalies = query_anomalies_from_db(start_time=start_time, end_time=end_time)
+    logger.info(f"Returning {len(anomalies)} anomalies.")
+    return anomalies
+
+# --- Endpoint for Pollution Density ---
+@app.get(
+    f"{API_PREFIX}/pollution_density",
+    response_model=Optional[PollutionDensity], # Can return null if no data
+    summary="Get Pollution Density for Bounding Box",
+    description="Calculates the average pollution levels for a specified geographic bounding box and time window using data stored in InfluxDB. Utilizes geohash filtering for efficiency if available."
+    )
+async def get_pollution_density_for_bbox(
+    min_lat: float = Query(..., description="Minimum latitude of the bounding box.", ge=-90, le=90),
+    max_lat: float = Query(..., description="Maximum latitude of the bounding box.", ge=-90, le=90),
+    min_lon: float = Query(..., description="Minimum longitude of the bounding box.", ge=-180, le=180),
+    max_lon: float = Query(..., description="Maximum longitude of the bounding box.", ge=-180, le=180),
+    window: str = Query("24h", description="Time window for averaging (e.g., '1h', '24h', '7d'). Format: InfluxDB duration literal.")
+):
+    """
+    Aggregates all data points within the bounding box and time window to provide
+    average pollution metrics and a count of data points used.
+    """
+    logger.info(f"Request for density: bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}], window={window}")
+    # Basic validation for bounding box coordinates
+    if min_lat >= max_lat or min_lon >= max_lon:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid bounding box coordinates: min values must be less than max values."
+        )
+
+    density_data = query_density_in_bbox(
+        min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon, window=window
+    )
+
+    if not density_data:
+        # Return None (which becomes JSON null) as per the response model Optional[]
+        logger.info(f"No density data found for bbox [{min_lat},{min_lon} - {max_lat},{max_lon}], window {window}.")
+        return None
+
+    logger.info(f"Returning density data for bbox.")
+    return density_data
+
+
+# --- Endpoint for Specific Location ---
+@app.get(
+    f"{API_PREFIX}/air_quality/location",
+    response_model=Optional[AirQualityReading], # Response can be None
+    summary="Get Latest Data for a Geohash Cell",
+    description="Retrieves the absolute latest air quality reading stored within a specific geohash cell, determined by the input latitude, longitude, and desired precision. Useful for getting data 'near' a point without needing exact coordinates."
+)
+async def get_air_quality_for_location(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude to determine the geohash cell."),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude to determine the geohash cell."),
+    # Default precision to storage precision, allow range (e.g., 4 to 9)
+    # Precision 5 as requested max, but allow flexibility. Defaulting to storage precision (e.g., 7)
+    # often makes sense to find *any* data in the finest stored grid first.
+    geohash_precision: int = Query(
+        settings.geohash_precision_storage, # Default to storage precision
+        ge=2, # Minimum reasonable precision for this use case
+        le=6, # Maximum standard geohash precision
+        description=f"Geohash precision level to search within (1=large cell, 9=small cell). Determines the size of the grid cell. Defaults to storage precision ({settings.geohash_precision_storage})."
+    ),
+    window: str = Query("24h", description="Time window to look back for the latest data (e.g., '1h', '15m'). Format: InfluxDB duration literal.")
+):
+    """
+    Calculates the geohash for the given lat/lon at the specified `geohash_precision`.
+    Looks for the most recent data point tagged with this exact geohash within the specified `window`.
+    Returns null if no data is found.
+    """
+    logger.info(f"Request received for specific location: lat={lat}, lon={lon}, precision={geohash_precision}, window={window}")
+
+    # Call the updated database query function
+    data = query_latest_location_data(
+        lat=lat,
+        lon=lon,
+        precision=geohash_precision, # Pass the requested precision
+        window=window
+    )
+
+    if not data:
+         logger.info(f"No data found for location {lat},{lon} at precision {geohash_precision} within window {window}. Returning null.")
+         return None
+
+    logger.info(f"Returning latest data found within geohash cell for location {lat},{lon} (precision {geohash_precision}).")
+    # The query function returns the Pydantic model directly or None
+    return data
+
+# --- POST Endpoint for Ingesting Data ---
+@app.post(
+    f"{API_PREFIX}/air_quality/ingest",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ingest Air Quality Data",
+    description="Accepts a single air quality data point and publishes it to a queue for asynchronous processing and storage."
+    )
 async def ingest_air_quality_data(
     ingest_data: IngestRequest = Body(...)
 ):
     """
-    Receives air quality data, validates, and publishes ASYNCHRONOUSLY to the raw data queue
-    for processing by the worker.
+    Receives sensor data, performs basic validation, and puts it onto the
+    RabbitMQ queue for the worker to process. Returns 202 Accepted on success.
     """
-    logger.info(f"API: Received ingest request for {ingest_data.latitude},{ingest_data.longitude}")
+    # Log only essential info at INFO level, more detail at DEBUG
+    logger.info(f"API: Received ingest request for lat={ingest_data.latitude}, lon={ingest_data.longitude}")
+    logger.debug(f"API: Full ingest request data: {ingest_data.model_dump()}")
 
-    # Call the publish function which uses the connection pool
+    # Publish message asynchronously using the queue client's pooled connection
     success = await queue_client.publish_message_async(ingest_data.model_dump())
 
     if success:
-        logger.debug(f"API: Published data for {ingest_data.latitude}, {ingest_data.longitude} to queue.")
-        return {"message": "Data point accepted and queued for processing"}
+        logger.debug(f"API: Successfully published data for {ingest_data.latitude}, {ingest_data.longitude} to queue.")
+        return {"message": "Data point accepted for processing"}
     else:
-        logger.error(f"API: FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude} to queue.")
+        # Log the failure and return an error response
+        logger.error(f"API: FAILED to publish data for {ingest_data.latitude}, {ingest_data.longitude} after retries.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to queue data for processing after retries. Message queue service may be temporarily unavailable."
+            detail="Failed to queue data for processing. The queue service may be temporarily unavailable or overloaded."
         )
 
-@app.get(f"{API_PREFIX}/air_quality/location", response_model=Optional[AirQualityReading])
-async def get_air_quality_for_location(
-    lat: float = Query(..., ge=-90, le=90, description="Latitude of the location"),
-    lon: float = Query(..., ge=-180, le=180, description="Longitude of the location")
-):
+# --- WebSocket Endpoint for Live Anomaly Notifications ---
+@app.websocket(f"{API_PREFIX}/ws/anomalies")
+async def websocket_endpoint(websocket: WebSocket):
     """
-    Get the latest air quality data for a specific location from InfluxDB.
-    Searches within the last hour by default. Returns null if no recent data is found.
+    WebSocket endpoint for clients to connect and receive live anomaly notifications.
+    Sends recent anomalies upon connection.
     """
-    logger.info(f"API: Request received for latest data at lat={lat}, lon={lon}")
-    # Call the database query function
-    reading = db_client.query_latest_location_data(lat=lat, lon=lon, window="1h")
+    connection_id = await websocket_manager.manager.connect(websocket)
+    logger.info(f"WebSocket client {connection_id} connected. Current connections: {len(websocket_manager.manager.active_connections)}")
 
-    if reading is None:
-         logger.info(f"API: No recent data found for {lat},{lon}.")
-         # Returning None automatically results in 200 with null body for Optional[...]
-         return None
+    # Send a welcome message
+    try:
+        await websocket.send_json({
+            "type": "connection_status",
+            "message": "Connected to anomaly notification service",
+            "status": "connected",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        logger.info(f"Sent welcome message to client {connection_id}")
 
-    logger.debug(f"API: Found latest reading for {lat},{lon}")
-    return reading
+        # --- Send recent anomalies ---
+        try:
+            # Query recent anomalies (e.g., last 10)
+            recent_anomalies = query_anomalies_from_db() 
+            logger.info(f"Fetched {len(recent_anomalies)} recent anomalies for client {connection_id}")
 
-# --- Endpoint for Multiple Recent Points ---
-# This replaces the dummy get_multiple_air_quality_points
-@app.get(f"{API_PREFIX}/air_quality/points", response_model=List[AirQualityReading])
-async def get_multiple_air_quality_points(
-    limit: int = Query(50, gt=0, le=200, description="Max number of distinct location points to return"),
-    window: str = Query("1h", description="Time window to look for latest data (e.g., '1h', '24h', '5m')"),
-    # Added optional bbox filters, aligning with the concept from the removed duplicate endpoint
-    min_lat: Optional[float] = Query(None, ge=-90, le=90, description="Minimum latitude for bounding box"),
-    max_lat: Optional[float] = Query(None, ge=-90, le=90, description="Maximum latitude for bounding box"),
-    min_lon: Optional[float] = Query(None, ge=-180, le=180, description="Minimum longitude for bounding box"),
-    max_lon: Optional[float] = Query(None, ge=-180, le=180, description="Maximum longitude for bounding box")
-):
+            if recent_anomalies:
+                # Send each recent anomaly individually
+                for anomaly in recent_anomalies:
+                    try:
+                        await websocket.send_json({
+                            "type": "recent_anomaly", # Distinguish from live broadcast
+                            "payload": anomaly.model_dump(mode='json')
+                        })
+                    except Exception as send_err:
+                        logger.error(f"Failed to send recent anomaly {anomaly.id} to client {connection_id}: {send_err}")
+
+                logger.info(f"Finished sending {len(recent_anomalies)} recent anomalies to client {connection_id}")
+            else:
+                logger.info(f"No recent anomalies found to send to client {connection_id}")
+
+        except Exception as db_err:
+            logger.error(f"Failed to query recent anomalies for client {connection_id}: {db_err}")
+
+    except Exception as e:
+        logger.error(f"Error during initial connection or sending recent anomalies for client {connection_id}: {e}")
+        await websocket_manager.manager.disconnect(connection_id)
+        return
+
+    try:
+        while True:
+            # Keep the connection alive and handle incoming messages
+            data = await websocket.receive_text()
+            logger.debug(f"Received message from client {connection_id}: {data}")
+
+            # Handle ping messages
+            if data == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "message": "Server received ping",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                logger.debug(f"Sent pong response to client {connection_id}")
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client {connection_id} disconnected")
+        await websocket_manager.manager.disconnect(connection_id)
+    except Exception as e:
+        logger.error(f"WebSocket error with client {connection_id}: {e}")
+        await websocket_manager.manager.disconnect(connection_id)
+
+# --- Test Endpoint for WebSocket Anomaly Broadcast ---
+@app.post(
+    f"{API_PREFIX}/test/broadcast-anomaly",
+    summary="Test Anomaly Broadcast via RabbitMQ",
+    description="Creates a test anomaly and publishes it to the RabbitMQ broadcast exchange for testing distributed WebSocket delivery."
+)
+async def test_anomaly_broadcast():
     """
-    Get a list of recent air quality readings from distinct locations stored in InfluxDB,
-    optionally filtered by a bounding box.
+    Creates a test anomaly and publishes it to the RabbitMQ fanout exchange.
+    All connected API instances should receive this via their consumer and broadcast locally.
     """
-    logger.info(f"API: Request received for recent points: limit={limit}, window={window}, bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}]")
+    logger.info("API: Creating and publishing test anomaly to broadcast exchange")
 
-    # Note: The current db_client.query_recent_points function doesn't support bbox filtering.
-    # This endpoint definition *includes* bbox parameters, suggesting a potential future enhancement
-    # in db_client. For now, the bbox parameters will be accepted but ignored by the current db_client function.
-    # If bbox filtering is critical, db_client.query_recent_points would need modification.
-    if any([min_lat, max_lat, min_lon, max_lon]) and not all([min_lat, max_lat, min_lon, max_lon]):
-         raise HTTPException(status_code=400, detail="If any bounding box parameter is provided, all must be provided.")
-    if all([min_lat, max_lat, min_lon, max_lon]):
-         if min_lat >= max_lat or min_lon >= max_lon:
-             raise HTTPException(status_code=400, detail="Invalid bounding box coordinates.")
-         logger.warning("Bounding box filtering requested but not currently implemented in db_client.query_recent_points. Returning all points within window/limit.")
-         # TODO: Implement bbox filtering in db_client.query_recent_points
-
-    # Call the database query function
-    readings = db_client.query_recent_points(limit=limit, window=window)
-
-    if readings is None: # db_client functions return list or None/empty list
-         logger.error("API: db_client.query_recent_points returned None.")
-         return [] # Return empty list if query fails or no data
-    return readings
-
-# --- Endpoint for Anomalies ---
-# This replaces the dummy list_anomalies
-@app.get(f"{API_PREFIX}/anomalies", response_model=List[Anomaly])
-async def list_anomalies(
-    start_time: Optional[datetime] = Query(None, description="Start time (ISO 8601 format) for filtering anomalies"),
-    end_time: Optional[datetime] = Query(None, description="End time (ISO 8601 format) for filtering anomalies")
-):
-    """
-    List detected anomalies stored in InfluxDB within a given time range.
-    Defaults to the last 24 hours if no range is provided.
-    NOTE: Anomalies must be detected (by worker) and written to InfluxDB.
-    """
-    logger.info(f"API: Request received for anomalies: start={start_time}, end={end_time}")
-    # Call the database query function
-    anomalies = db_client.query_anomalies_from_db(start_time=start_time, end_time=end_time)
-
-    if anomalies is None: # db_client functions return list or None/empty list
-        logger.error("API: db_client.query_anomalies_from_db returned None.")
-        return [] # Return empty list if query fails or no data
-
-    logger.info(f"API: Returning {len(anomalies)} anomalies.")
-    return anomalies
-
-# --- Endpoint for Pollution Density ---
-# This replaces the dummy get_pollution_density_for_region and uses bbox parameters
-@app.get(f"{API_PREFIX}/pollution_density", response_model=Optional[PollutionDensity])
-async def get_pollution_density_for_bbox(
-    min_lat: float = Query(..., description="Minimum latitude of the bounding box"),
-    max_lat: float = Query(..., description="Maximum latitude of the bounding box"),
-    min_lon: float = Query(..., description="Minimum longitude of the bounding box"),
-    max_lon: float = Query(..., description="Maximum longitude of the bounding box"),
-    window: str = Query("24h", description="Time window for averaging (e.g., '1h', '24h')")
-):
-    """
-    Get the aggregated pollution density (average values and data point count)
-    for a specified geographic bounding box from InfluxDB.
-    Returns null if no data is found in the region and time window.
-    """
-    logger.info(f"API: Request received for density: bbox=[{min_lat},{min_lon} to {max_lat},{max_lon}], window={window}")
-    # Basic validation for bounding box
-    if min_lat >= max_lat or min_lon >= max_lon:
-        raise HTTPException(status_code=400, detail="Invalid bounding box coordinates: min must be less than max.")
-    if not (-90 <= min_lat <= 90) or not (-90 <= max_lat <= 90) or not (-180 <= min_lon <= 180) or not (-180 <= max_lon <= 180):
-         raise HTTPException(status_code=400, detail="Invalid bounding box coordinates: lat/lon out of range.")
-
-
-    # Call the database query function
-    density_data = db_client.query_density_in_bbox(
-        min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon, window=window
+    # Create a test anomaly
+    import uuid
+    test_anomaly = Anomaly(
+        id=f"test_anomaly_{uuid.uuid4()}",
+        latitude=36.88,
+        longitude=30.70,
+        timestamp=datetime.now(timezone.utc),
+        parameter="pm25",
+        value=180.5,
+        description="TEST ANOMALY - High PM2.5 level detected in Antalya (via RabbitMQ)"
     )
 
-    if density_data is None:
-        logger.info(f"API: No density data found for bbox [{min_lat:.2f},{min_lon:.2f} - {max_lat:.2f},{max_lon:.2f}] in window {window}.")
-        # Return None as per Optional[PollutionDensity] response model
-        return None
+    # Publish the test anomaly to the broadcast exchange
+    try:
+        # Use the specific broadcast publish function
+        success = await queue_client.publish_broadcast_message_async(test_anomaly.model_dump(mode='json'))
+        if success:
+            logger.info(f"API: Test anomaly {test_anomaly.id} published to broadcast exchange successfully.")
+            return {"message": "Test anomaly published to broadcast exchange", "anomaly_id": test_anomaly.id}
+        else:
+            logger.error(f"API: FAILED to publish test anomaly {test_anomaly.id} to broadcast exchange.")
+            raise HTTPException(status_code=503, detail="Failed to publish test anomaly to broadcast exchange.")
+    except Exception as e:
+        logger.error(f"API: Error publishing test anomaly: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error publishing test anomaly: {str(e)}")
 
-    logger.debug(f"API: Returning density data: {density_data.region_name}")
-    return density_data
-
-# --- End of API Endpoints ---
+# --- Basic Root Endpoint ---
+@app.get("/", summary="Root Endpoint", description="Basic API information.")
+async def read_root():
+    return {"message": "Welcome to the Air Quality API. See /docs for details."}

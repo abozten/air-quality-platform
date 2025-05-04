@@ -11,27 +11,31 @@ from datetime import datetime, timezone
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Use relative imports
+# Use relative imports as configured before
 try:
-    from .config import get_settings # Use get_settings() here
+    from .config import get_settings
     from .models import AirQualityReading, IngestRequest, Anomaly
     from . import db_client # Keep sync DB client for now
     from . import anomaly_detection # Keep sync anomaly detection
+    # Remove direct import of websocket_manager, worker no longer broadcasts directly
+    # from . import websocket_manager
+    # Import the specific publish function needed
+    from .queue_client import publish_broadcast_message_async, connection_pool, initialize_rabbitmq_pool, close_rabbitmq_pool
 except ImportError as e:
      logger.error(f"Failed to import necessary modules. Ensure structure is correct. Error: {e}")
      sys.exit(1)
 
-settings = get_settings() # Get settings
+settings = get_settings()
 RAW_DATA_QUEUE = settings.rabbitmq_queue_raw
 RABBITMQ_URL = f"amqp://{settings.rabbitmq_user}:{settings.rabbitmq_pass}@{settings.rabbitmq_host}:{settings.rabbitmq_port}/"
 PREFETCH_COUNT = 10 # How many messages the worker can process concurrently (tune as needed)
 
 async def process_message(message: aio_pika.IncomingMessage):
     """Async callback function to process a message from the queue."""
-    # Use the context manager for automatic ACK/NACK based on exceptions
-    # Requeue=False means messages causing processing errors are discarded
-    async with message.process(requeue=False, ignore_processed=True):
-        logger.info(f"WORKER: Received message. Delivery tag: {message.delivery_tag}")
+    # Get the current running loop to schedule executor tasks
+    loop = asyncio.get_running_loop()
+    async with message.process(requeue=False, ignore_processed=True): # Context manager handles ack/nack based on exceptions
+        logger.info(f"WORKER: Received message. Routing key: {message.routing_key}, Delivery tag: {message.delivery_tag}")
         data = None
         try:
             # 1. Decode body
@@ -42,222 +46,217 @@ async def process_message(message: aio_pika.IncomingMessage):
             # 2. Parse JSON
             logger.debug("WORKER: Attempting to parse JSON...")
             data = json.loads(body_str)
-            logger.debug(f"WORKER: JSON parsed.") # Avoid logging full data unless necessary
+            logger.debug(f"WORKER: JSON parsed. Data: {data}")
 
-            # 3. Validate with Pydantic (using IngestRequest model from API)
+            # 3. Validate with Pydantic
             logger.debug("WORKER: Attempting Pydantic validation...")
             try:
                 ingest_data = IngestRequest(**data)
                 logger.debug("WORKER: Pydantic validation successful.")
             except Exception as pydantic_error:
-                logger.error(f"WORKER: Pydantic validation failed for incoming data. Error: {pydantic_error}. Discarding message (Delivery tag: {message.delivery_tag}).", exc_info=True)
-                return # Stop processing this message
+                logger.error(f"WORKER: Pydantic validation failed for data: {data}. Error: {pydantic_error}. Discarding (NACKing) message.", exc_info=True)
+                # Context manager handles NACK on exception
+                return # Stop processing
 
             # 4. Process Validated Data
-            logger.info(f"WORKER: Processing reading for {ingest_data.latitude},{ingest_data.longitude} (Delivery tag: {message.delivery_tag})...")
-            # Create the AirQualityReading object, adding the timestamp from the worker's perspective
+            logger.info(f"WORKER: Processing reading for {ingest_data.latitude},{ingest_data.longitude}...")
+            current_time_utc = datetime.now(timezone.utc)
             reading = AirQualityReading(
                 latitude=ingest_data.latitude,
                 longitude=ingest_data.longitude,
-                timestamp=datetime.now(timezone.utc), # Worker adds the timestamp (UTC)
+                timestamp=current_time_utc,
                 pm25=ingest_data.pm25,
                 pm10=ingest_data.pm10,
                 no2=ingest_data.no2,
                 so2=ingest_data.so2,
                 o3=ingest_data.o3
             )
-            logger.debug(f"WORKER: Constructed AirQualityReading object for {reading.latitude},{reading.longitude} at {reading.timestamp.isoformat()}")
+            logger.info(f"WORKER: Constructed AirQualityReading object for {reading.latitude},{reading.longitude} at {reading.timestamp}")
 
-            # --- Synchronous DB/Anomaly Logic ---
-            # NOTE: These are blocking calls within an async function.
-            # For true async performance, use async DB clients and potentially run checks concurrently.
-            # Using loop.run_in_executor is the standard way to run sync code in async:
+            # --- Execute Blocking DB/Anomaly Logic in Thread Pool Executor ---
 
-            loop = asyncio.get_running_loop()
+            # 4.1. Write data to InfluxDB (Offloaded)
+            logger.debug("WORKER: Attempting non-blocking write to InfluxDB...")
+            write_success = await loop.run_in_executor(
+                None,  # Use default ThreadPoolExecutor
+                db_client.write_air_quality_data,
+                reading
+            )
+            if not write_success:
+                # Log the error, but context manager will NACK automatically on exit if needed
+                logger.error(f"WORKER: Failed write to InfluxDB for {reading.latitude},{reading.longitude}. Discarding (NACKing).")
+                # We still raise an exception here to ensure the context manager NACKs
+                raise IOError("Failed to write data to InfluxDB")
+            logger.debug("WORKER: Write to InfluxDB successful (offloaded).")
 
-            # 4.1. Write data to InfluxDB (Run sync call in executor)
-            logger.debug("WORKER: Attempting sync write to InfluxDB via executor...")
-            try:
-                write_success = await loop.run_in_executor(None, db_client.write_air_quality_data, reading)
-                if not write_success:
-                    logger.error(f"WORKER: Failed sync write to InfluxDB for {reading.latitude},{reading.longitude}. Discarding message (Delivery tag: {message.delivery_tag}).")
-                    # Context manager will NACK because of the raised exception below
-                    raise RuntimeError("Failed to write data to InfluxDB") # Raise to trigger NACK
-                logger.debug("WORKER: Sync write to InfluxDB successful.")
-            except Exception as write_ex:
-                 logger.error(f"WORKER: Exception during sync write execution for {reading.latitude},{reading.longitude}: {write_ex}", exc_info=True)
-                 # Let context manager handle NACK (it will NACK because of this exception)
-                 raise write_ex # Re-raise to ensure NACK
-
-            # 4.2. Perform Anomaly Detection (Run sync call in executor)
-            logger.debug("WORKER: Checking sync for anomalies via executor...")
-            anomaly = None # Initialize anomaly variable
-            try:
-                anomaly = await loop.run_in_executor(None, anomaly_detection.check_thresholds, reading)
-                if anomaly:
-                    logger.info(f"WORKER: Anomaly detected: {anomaly.description} (Delivery tag: {message.delivery_tag}).") # Changed level to INFO
-            except Exception as anomaly_ex:
-                logger.error(f"WORKER: Exception during sync anomaly check for {reading.latitude},{reading.longitude}: {anomaly_ex}", exc_info=True)
-                # Anomaly check failure is NOT a reason to NACK the message; the data was written.
-                # Log and continue.
-
-            # 4.3. Write Anomaly if detected (Run sync call in executor)
+            # 4.2. Perform Anomaly Detection (Offloaded)
+            logger.debug("WORKER: Checking non-blocking for anomalies...")
+            anomaly = await loop.run_in_executor(
+                None,
+                anomaly_detection.check_thresholds,
+                reading
+            )
             if anomaly:
-                logger.debug("WORKER: Attempting sync anomaly write via executor...")
+                logger.info(f"WORKER: Anomaly detected (non-blocking check): {anomaly.description}") # Changed level to INFO
+                # 4.3. Write Anomaly if detected (Offloaded)
+                logger.debug("WORKER: Attempting non-blocking anomaly write...")
+                write_anomaly_success = await loop.run_in_executor(
+                    None,
+                    db_client.write_anomaly_data,
+                    anomaly
+                )
+                if not write_anomaly_success:
+                    # Log error but don't fail the original message processing just for this
+                    logger.error(f"WORKER: Failed write for detected anomaly {anomaly.id} (non-blocking).")
+                else:
+                    logger.debug("WORKER: Non-blocking anomaly write successful.")
+
+                # 4.4. Publish anomaly to RabbitMQ Fanout Exchange for broadcasting
+                logger.debug("WORKER: Publishing anomaly to broadcast exchange...")
                 try:
-                    write_anomaly_success = await loop.run_in_executor(None, db_client.write_anomaly_data, anomaly)
-                    if not write_anomaly_success:
-                        logger.error(f"WORKER: Failed sync write for detected anomaly {anomaly.id}. (Delivery tag: {message.delivery_tag}).")
-                        # Anomaly write failure is NOT a reason to NACK the original data message. Log and continue.
+                    # Use the new publish function for the fanout exchange
+                    broadcast_success = await publish_broadcast_message_async(anomaly.model_dump(mode='json'))
+                    if broadcast_success:
+                        logger.info(f"WORKER: Anomaly {anomaly.id} published to broadcast exchange successfully.")
                     else:
-                         logger.debug("WORKER: Sync anomaly write successful.")
-                except Exception as write_anomaly_ex:
-                    logger.error(f"WORKER: Exception during sync anomaly write execution for {anomaly.id}: {write_anomaly_ex}", exc_info=True)
-                    # Anomaly write failure is NOT a reason to NACK the original data message. Log and continue.
+                        # Log error but don't fail processing just for broadcast failure
+                        logger.error(f"WORKER: Failed to publish anomaly {anomaly.id} to broadcast exchange.")
+                except Exception as pub_error:
+                    logger.error(f"WORKER: Error publishing anomaly {anomaly.id} to broadcast exchange: {pub_error}", exc_info=True)
+            else:
+                logger.debug("WORKER: No threshold anomalies detected (non-blocking check).")
 
-            # --- End Synchronous Block via Executor ---
+            # --- End Offloaded Block ---
 
-            # If we reach here without unhandled exceptions, the context manager will ACK the message.
-            logger.info(f"WORKER: Successfully processed message for {reading.latitude},{reading.longitude}. Message ACKed. (Delivery tag: {message.delivery_tag})")
+            # If we reach here without exceptions, the context manager will ACK the message.
+            logger.info(f"WORKER: Successfully processed message for {reading.latitude},{reading.longitude}. (Delivery tag: {message.delivery_tag}) - Message will be ACKed.")
 
         except json.JSONDecodeError:
-            logger.error(f"WORKER: JSONDecodeError. Body (start): {message.body[:100]}... Discarding message (Delivery tag: {message.delivery_tag}).", exc_info=True)
+            logger.error(f"WORKER: JSONDecodeError. Body (start): {message.body[:100]}... Discarding (NACKing).", exc_info=True)
+            # Context manager handles NACK
         except UnicodeDecodeError:
-            logger.error(f"WORKER: UnicodeDecodeError. Body (repr): {message.body!r}. Discarding message (Delivery tag: {message.delivery_tag}).", exc_info=True)
+            logger.error(f"WORKER: UnicodeDecodeError. Body (repr): {message.body!r}. Discarding (NACKing).", exc_info=True)
+            # Context manager handles NACK
         except Exception as e:
-            # Catch-all for unexpected errors during processing before explicit NACK/ACK points
-            # Note: Errors in steps 3, 4.1, 4.2, 4.3 might be caught here if not explicitly handled.
-            # The `message.process` context manager should handle exceptions raised within it.
-            # This catch-all is a safety net but indicates potential issues with finer-grained error handling.
-            logger.error(f"WORKER: Unexpected error processing message: {e}. Data (if parsed): {data}. Discarding message (Delivery tag: {message.delivery_tag}).", exc_info=True)
-            # The `message.process` context manager will NACK on unhandled exceptions.
+            # Catch-all for unexpected errors during processing, including the IOError raised above
+            logger.error(f"WORKER: Unexpected error processing message: {e}. Data (if parsed): {data}. Discarding (NACKing).", exc_info=True)
+            # Context manager handles NACK
+
 
 async def start_consuming(loop):
     """Connects to RabbitMQ and starts consuming messages asynchronously."""
     connection = None
-    channel = None
-    consumer_tag = None # To hold the tag for stopping the consumer
-    try:
-        while True: # Keep trying to connect
-            try:
-                logger.info("WORKER: Attempting async connection to RabbitMQ...")
-                # Use robust connection which handles reconnects
-                connection = await aio_pika.connect_robust(RABBITMQ_URL, loop=loop, timeout=15)
-                logger.info("WORKER: Async connection established.")
+    while True: # Keep trying to connect
+        try:
+            logger.info("WORKER: Attempting async connection to RabbitMQ...")
+            connection = await aio_pika.connect_robust(RABBITMQ_URL, loop=loop, timeout=15)
+            logger.info("WORKER: Async connection established.")
 
-                # Creating a channel
-                channel = await connection.channel()
-                logger.info("WORKER: Channel created.")
+            # Creating a channel
+            channel = await connection.channel()
+            logger.info("WORKER: Channel created.")
 
-                # Set Quality of Service - limits the number of unacknowledged messages
-                await channel.set_qos(prefetch_count=PREFETCH_COUNT)
-                logger.info(f"WORKER: QoS set to {PREFETCH_COUNT}")
+            # Set Quality of Service
+            await channel.set_qos(prefetch_count=PREFETCH_COUNT)
+            logger.info(f"WORKER: QoS set to {PREFETCH_COUNT}")
 
-                # Declare the queue ( idempotent - safe to call on startup)
-                queue = await channel.declare_queue(RAW_DATA_QUEUE, durable=True)
-                logger.info(f"WORKER: Queue '{RAW_DATA_QUEUE}' declared.")
+            # Declare the queue
+            queue = await channel.declare_queue(RAW_DATA_QUEUE, durable=True)
+            logger.info(f"WORKER: Queue '{RAW_DATA_QUEUE}' declared. Waiting for messages...")
 
-                # Start consuming messages
-                # Pass the async callback to queue.consume
-                # store consumer_tag to allow cancellation
-                consumer_tag = await queue.consume(process_message)
-                logger.info(f"WORKER: Consumer started with tag '{consumer_tag}'. Waiting for messages...")
+            # Start consuming messages
+            await queue.consume(process_message) # Pass the async callback
 
-                # This future will complete if the connection is closed or an exception occurs
-                await connection.channel(0).wait_closed() # Wait for the connection channel to close
+            # Keep consuming indefinitely until connection breaks or shutdown signal
+            # Adding a future that completes on shutdown signal
+            stop_event = asyncio.Event()
+            loop.add_signal_handler(signal.SIGINT, stop_event.set)
+            loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+            logger.info("WORKER: Consumer started. Press CTRL+C to exit.")
+            await stop_event.wait() # Wait until SIGINT/SIGTERM
 
-            except (aio_pika.exceptions.AMQPConnectionError, ConnectionError, OSError) as e:
-                logger.error(f"WORKER: Connection/AMQP error: {e}. Retrying connection in 5 seconds...", exc_info=True)
-                # Close connection/channel if they exist but aren't closed robustly
-                if channel and not channel.is_closed:
-                    try: await channel.close()
-                    except Exception: pass
-                if connection and not connection.is_closed:
-                    try: await connection.close()
-                    except Exception: pass
-                await asyncio.sleep(5) # Wait before next retry
-            except asyncio.CancelledError:
-                logger.info("WORKER: Task cancelled, likely during shutdown.")
-                break # Exit retry loop on explicit cancellation
-            except Exception as e:
-                logger.error(f"WORKER: An unexpected error occurred in consumer loop: {e}", exc_info=True)
-                # Decide if this kind of error warrants a retry or a full shutdown
-                # For now, log and retry connection
-                if channel and not channel.is_closed:
-                    try: await channel.close()
-                    except Exception: pass
-                if connection and not connection.is_closed:
-                    try: await connection.close()
-                    except Exception: pass
-                logger.info("WORKER: Restarting consumer loop after 10 seconds due to unexpected error...")
-                await asyncio.sleep(10)
+            # Graceful shutdown requested
+            logger.info("WORKER: Shutdown signal received, stopping consumer...")
+            break # Exit the while loop
 
-    finally:
-         logger.info("WORKER: Exiting start_consuming loop.")
-         # Attempt to close resources during final exit
-         if channel and not channel.is_closed:
-             try: await channel.close()
-             except Exception as e: logger.error(f"Error closing channel in finally: {e}")
-         if connection and not connection.is_closed:
-             try: await connection.close()
-             except Exception as e: logger.error(f"Error closing connection in finally: {e}")
+        except (aio_pika.exceptions.AMQPConnectionError, ConnectionError, OSError) as e:
+            logger.error(f"WORKER: Connection/AMQP error: {e}. Retrying in 5 seconds...", exc_info=False) # Reduced noise for common errors
+            if connection and not connection.is_closed:
+                 try: await connection.close()
+                 except Exception: pass # Ignore errors during close on error path
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("WORKER: Task cancelled, likely during shutdown.")
+            break
+        except Exception as e:
+            logger.error(f"WORKER: An unexpected error occurred in consumer loop: {e}", exc_info=True)
+            if connection and not connection.is_closed:
+                 try: await connection.close()
+                 except Exception: pass
+            logger.info("WORKER: Restarting consumer loop after 10 seconds...")
+            await asyncio.sleep(10)
+        finally:
+             if connection and not connection.is_closed:
+                 logger.info("WORKER: Closing connection in finally block.")
+                 await connection.close()
 
 
 async def main():
     """Main async function to start the consumer."""
-    loop = asyncio.get_event_loop() # Use get_event_loop for compatibility, or get_running_loop if guaranteed context
-    # Set up signal handlers for graceful shutdown
-    stop_event = asyncio.Event()
-    def signal_handler():
-        logger.info("WORKER: Shutdown signal received (SIGINT/SIGTERM), setting stop event.")
-        stop_event.set()
-    try:
-        loop.add_signal_handler(signal.SIGINT, signal_handler)
-        loop.add_signal_handler(signal.SIGTERM, signal_handler)
-        logger.info("WORKER: Signal handlers added for SIGINT/SIGTERM.")
-    except NotImplementedError:
-        logger.warning("WORKER: Signal handlers not supported on this platform (e.g., Windows), graceful shutdown with CTRL+C might not work.")
+    logger.info("WORKER: Initializing RabbitMQ connection pool...")
+    await initialize_rabbitmq_pool() # Initialize the pool for the worker
+    logger.info("WORKER: RabbitMQ connection pool initialized.")
 
-
-    # Initialize the InfluxDB client synchronously before starting the consumer loop
-    # This ensures it's ready when process_message is called.
-    logger.info("WORKER: Initializing InfluxDB client (sync)...")
-    db_client.initialize_influxdb_client()
-    logger.info("WORKER: InfluxDB client initialization finished.")
-
-
-    # Start the consuming task
+    loop = asyncio.get_running_loop()
     consumer_task = loop.create_task(start_consuming(loop))
 
-    # Wait until stop_event is set or consumer task finishes (e.g., due to connection failure)
-    logger.info("WORKER: Waiting for stop event or consumer task completion...")
-    await asyncio.gather(consumer_task, stop_event.wait()) # Wait for either
+    # Handle graceful shutdown for the main task as well
+    stop_event = asyncio.Event()
+    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
 
-    logger.info("WORKER: Stop event set or consumer task finished. Beginning shutdown...")
+    # Create a task for the stop event wait coroutine
+    stop_wait_task = asyncio.create_task(stop_event.wait())
 
-    # Consumer task might still be running, try to cancel it gracefully
-    if not consumer_task.done():
-        logger.info("WORKER: Cancelling consumer task...")
+    # Wait for either the consumer task to finish naturally (unlikely)
+    # or for the shutdown signal to be received
+    done, pending = await asyncio.wait(
+        [consumer_task, stop_wait_task], # Pass tasks, not coroutines
+        return_when=asyncio.FIRST_COMPLETED
+    )
+
+    # If the stop event finished first, cancel the consumer task
+    if stop_wait_task in done: # Check if the stop task completed
+        logger.info("WORKER: Main loop received shutdown signal, cancelling consumer task...")
         consumer_task.cancel()
-        try:
-            await consumer_task
-        except asyncio.CancelledError:
-            logger.info("WORKER: Consumer task cancelled successfully.")
-        except Exception as e:
-            logger.error(f"WORKER: Exception awaiting cancelled consumer task: {e}", exc_info=True)
-
-    logger.info("WORKER: Async worker main function finished.")
+        # Wait for the consumer task to actually cancel
+        await asyncio.gather(consumer_task, return_exceptions=True)
+    # Clean up the stop_wait_task if it's still pending (consumer_task finished first)
+    elif stop_wait_task in pending:
+        stop_wait_task.cancel()
+        await asyncio.gather(stop_wait_task, return_exceptions=True)
 
 if __name__ == "__main__":
     logger.info("Starting Async Air Quality Worker...")
     try:
-        # asyncio.run() is suitable for top-level script execution
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("WORKER: KeyboardInterrupt caught in __main__.")
-        # asyncio.run should handle signal, but this ensures message if it doesn't
+        logger.info("WORKER: KeyboardInterrupt received in main.")
     finally:
         logger.info("WORKER: Cleaning up resources...")
-        # Close InfluxDB connection (still synchronous)
+        # Close RabbitMQ pool connections
+        logger.info("WORKER: Closing RabbitMQ connection pool...")
+        # Run the async close function in a new event loop if the main one is stopped
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.run_until_complete(close_rabbitmq_pool())
+            else:
+                asyncio.run(close_rabbitmq_pool())
+            logger.info("WORKER: RabbitMQ connection pool closed.")
+        except Exception as e:
+            logger.error(f"WORKER: Error closing RabbitMQ pool: {e}", exc_info=True)
+
+        # Close InfluxDB connection (still synchronous, called after event loop stops)
         db_client.close_influx_client()
-        logger.info("WORKER: Async Air Quality Worker finished execution.")
+        logger.info("WORKER: Async Air Quality Worker finished.")
