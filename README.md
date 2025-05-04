@@ -46,7 +46,7 @@ A full-stack application for collecting, processing, storing, and visualizing re
 
 1.  **Clone the repository:**
     ```bash
-    git clone <your-repository-url>
+    git clone https://github.com/abozten/air-quality-platform-kartaca/
     cd air-quality-platform
     ```
 
