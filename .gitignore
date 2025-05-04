@@ -1,5 +1,9 @@
 .env
 __pycache__/
 .DS_Store
+<<<<<<< HEAD
 *.pyc
 node_modules/
+=======
+/node_modules
+>>>>>>> 3a1a60f (feat: Add node_modules to .gitignore to prevent tracking of dependencies)
