@@ -477,141 +477,60 @@ def query_density_in_bbox(
     min_lat: float, max_lat: float, min_lon: float, max_lon: float, window: str = "24h"
 ) -> Optional[PollutionDensity]:
     """
-    Calculates average pollution density within a bounding box and time window,
-    primarily using geohash filtering based on the storage precision. (FIXED AGAIN)
+    Calculates average pollution density within a bounding box and time window.
+    Uses the query_raw_points_in_bbox function to fetch data points and then
+    calculates the statistics from those points.
     """
     if not query_api:
         logger.error("InfluxDB query_api not available.")
         return None
 
-    location_filter = ""
-    bbox_geohashes = []
-    try:
-        bbox_geohashes = calculate_geohashes_for_bbox(
-            min_lat, max_lat, min_lon, max_lon,
-            precision=7
-        )
-    except ImportError:
-         logger.warning("Geohash library not installed. Cannot use geohash filtering for density query.")
-    except Exception as e:
-        logger.error(f"Error calculating geohashes for bbox density query: {e}", exc_info=True)
+    # Use the existing function to get raw points in the bounding box
+    logger.info(f"Fetching raw points in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for density calculation, window {window}")
+    raw_points = query_raw_points_in_bbox(
+        min_lat=min_lat,
+        max_lat=max_lat,
+        min_lon=min_lon,
+        max_lon=max_lon,
+        window=window,
+        limit=10000  # Use a generous limit to get a good sample for density
+    )
 
-    if bbox_geohashes:
-        flux_geohash_set = json.dumps(bbox_geohashes)
-        location_filter = f'|> filter(fn: (r) => contains(value: r.geohash, set: {flux_geohash_set}))'
-        logger.debug(f"Density query using geohash filter with {len(bbox_geohashes)} prefixes (precision {7}).")
-    else:
-        # Fallback to coordinate filtering
-        logger.warning(f"Density query falling back to coordinate filtering for bbox [{min_lat},{min_lon} - {max_lat},{max_lon}]. This may be less efficient.")
-        location_filter = f'''
-          |> filter(fn: (r) => exists r.latitude and exists r.longitude)
-          |> map(fn: (r) => ({{ r with latitude_float: float(v: r.latitude), longitude_float: float(v: r.longitude) }}))
-          |> filter(fn: (r) => r.latitude_float >= {min_lat} and r.latitude_float <= {max_lat} and r.longitude_float >= {min_lon} and r.longitude_float <= {max_lon})
-        '''
-
-    # *** FIXES applied to the Flux query string ***
-    flux_query = f'''
-    import "math"
-    import "types" // Import types package for type testing
-
-    base_data = from(bucket: "{influx_bucket}")
-      |> range(start: -{window})
-      |> filter(fn: (r) => r["_measurement"] == "air_quality")
-      {location_filter} // Apply geohash or coordinate filter
-      |> filter(fn: (r) => r["_field"] == "pm25" or r["_field"] == "pm10" or r["_field"] == "no2" or r["_field"] == "so2" or r["_field"] == "o3")
-      // Ensure values are valid numbers using correct Flux syntax and type check
-      // Check type first, then check for NaN only (remove null check)
-      |> filter(fn: (r) =>
-            types.isNumeric(v: r._value) and // Ensure it's a numeric type first
-            not math.isNaN(f: r._value)      // Check for NaN
-        ) // <-- Removed 'null' check, only type and NaN check remain
-
-    counts = base_data
-      |> group(columns: ["_field"])
-      |> count()
-      |> group()
-      |> yield(name: "counts")
-
-    means = base_data // <-- FIX: Corrected typo from base_da to base_data
-      |> group(columns: ["_field"])
-      |> mean()
-      |> group()
-      |> yield(name: "means")
-    '''
-
-    logger.debug(f"Executing Flux query for density:\n{flux_query}")
-    logger.info(f"{flux_query}")
-    try:
-        query_results = query_api.query(query=flux_query, org=influx_org)
-
-        mean_data = {}
-        count_data = {}
-        data_points_count = 0 # Overall count, might be approximated if counts per field differ slightly
-
-        # Extract data from yielded tables
-        for table in query_results:
-            if not table.records:
-                continue # Skip empty tables
-
-            # Get the yielded table name from metadata
-            table_name = getattr(table, '_table', None)
-            if table_name and hasattr(table_name, '_metadata'):
-                yield_name = table_name._metadata.get('name')
-            else:
-                yield_name = None
-
-            field_name = table.records[0].values.get('_field') # Field name should be consistent within a yielded table
-            if not field_name:
-                continue # Skip tables without field info
-
-            if yield_name == "means":
-                logger.debug(f"Processing 'means' table for field '{field_name}'")
-                mean_value = table.records[0].get_value() # Get the calculated mean
-                if mean_value is not None:
-                    mean_data[field_name] = mean_value
-            elif yield_name == "counts":
-                logger.debug(f"Processing 'counts' table for field '{field_name}'")
-                count_value = table.records[0].get_value() # Get the calculated count
-                if count_value is not None:
-                    count_data[field_name] = count_value
-
-        if not mean_data and not count_data:
-            logger.info(f"No valid data found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for window {window}")
-            return None
-
-        # Determine the overall count - use max count found across metrics as a reasonable representation
-        if count_data:
-            data_points_count = max(count_data.values()) if count_data else 0
-            # Log if counts differ significantly (could indicate data sparsity for some metrics)
-            if len(set(count_data.values())) > 1:
-                 logger.warning(f"Inconsistent counts across fields: {count_data}. Using max value: {data_points_count}")
-        else:
-             logger.warning("Could not retrieve data point counts.")
-
-
-        # Construct the result object
-        density = PollutionDensity(
-            region_name=f"BBox:[{min_lat:.4f},{min_lon:.4f} to {max_lat:.4f},{max_lon:.4f}]", # Increased precision for display
-            average_pm25=mean_data.get('pm25'),
-            average_pm10=mean_data.get('pm10'),
-            average_no2=mean_data.get('no2'),
-            average_so2=mean_data.get('so2'),
-            average_o3=mean_data.get('o3'),
-            data_points_count=data_points_count
-        )
-        logger.info(f"Calculated density for bbox: PM2.5={density.average_pm25 or 'N/A'}, Count={density.data_points_count}")
-        return density
-
-    except InfluxDBError as e:
-        logger.error(f"InfluxDB Error querying density: {e}", exc_info=True)
-        if hasattr(e, 'response') and e.response and hasattr(e.response, 'data'):
-             # Log the response body which contains the Flux error message
-             logger.error(f"InfluxDB Response Body: {e.response.data.decode() if isinstance(e.response.data, bytes) else e.response.data}")
-        return None
-    except Exception as e:
-        logger.error(f"Generic error querying density: {e}", exc_info=True)
+    if not raw_points:
+        logger.info(f"No raw points found in bbox [{min_lat},{min_lon} - {max_lat},{max_lon}] for window {window}")
         return None
 
+    # Calculate averages for each pollutant
+    pm25_values = [p.pm25 for p in raw_points if p.pm25 is not None]
+    pm10_values = [p.pm10 for p in raw_points if p.pm10 is not None]
+    no2_values = [p.no2 for p in raw_points if p.no2 is not None]
+    so2_values = [p.so2 for p in raw_points if p.so2 is not None]
+    o3_values = [p.o3 for p in raw_points if p.o3 is not None]
+
+    # Helper function to calculate average
+    def calculate_avg(values):
+        return sum(values) / len(values) if values else None
+
+    # Construct the result object
+    density = PollutionDensity(
+        region_name=f"BBox:[{min_lat:.4f},{min_lon:.4f} to {max_lat:.4f},{max_lon:.4f}]",
+        average_pm25=calculate_avg(pm25_values),
+        average_pm10=calculate_avg(pm10_values),
+        average_no2=calculate_avg(no2_values),
+        average_so2=calculate_avg(so2_values),
+        average_o3=calculate_avg(o3_values),
+        data_points_count=len(raw_points)
+    )
+    
+    # Log metrics about the calculation
+    logger.info(f"Calculated density for bbox from {len(raw_points)} points: "
+                f"PM2.5={density.average_pm25 or 'N/A'} (from {len(pm25_values)} values), "
+                f"PM10={density.average_pm10 or 'N/A'} (from {len(pm10_values)} values), "
+                f"NO2={density.average_no2 or 'N/A'} (from {len(no2_values)} values), "
+                f"SO2={density.average_so2 or 'N/A'} (from {len(so2_values)} values), "
+                f"O3={density.average_o3 or 'N/A'} (from {len(o3_values)} values)")
+    
+    return density
 
 
 def write_air_quality_data(reading: AirQualityReading):
