@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Script to scan Europe at ~4 km resolution, send
+# Script to scan Europe at ~50 km resolution, send
 # all AQ parameters, with anomalies.
 
 set -euo pipefail
@@ -10,11 +10,11 @@ API_ENDPOINT="${API_BASE_URL:-http://localhost:8000/api/v1}/air_quality/ingest"
 PARAMETERS=("pm25" "pm10" "no2" "so2" "o3")
 
 # Default values
-DEFAULT_RATE=5            # requests per second
+DEFAULT_RATE=50            # requests per second
 DEFAULT_ANOMALY_CHANCE=0.001  # percent
 
-# 4 km ≈ 0.0359° (1° lat ≈ 111.32 km)
-DELTA_DEG=0.0359
+# 50 km ≈ 0.449° (1° lat ≈ 111.32 km)
+DELTA_DEG=1.449
 
 # Europe bounding box
 LAT_MIN=34
@@ -60,7 +60,7 @@ else
 fi
 
 log "Scanning Europe: lat ${LAT_MIN}→${LAT_MAX}, lon ${LON_MIN}→${LON_MAX}"
-log "Grid step: ${DELTA_DEG}° (~4 km), Rate: $RATE req/s, Anomaly: ${ANOMALY_CHANCE}%"
+log "Grid step: ${DELTA_DEG}° (~50 km), Rate: $RATE req/s, Anomaly: ${ANOMALY_CHANCE}%"
 log "API endpoint: $API_ENDPOINT"
 
 # --- Main Loop ---
