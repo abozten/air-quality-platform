@@ -390,12 +390,74 @@ async def get_air_quality_for_location(
 
 # --- NEW Endpoint for Location History ---
 @app.get(
-    f"{API_PREFIX}/air_quality/history/{{geohash_str}}/{{parameter}}",
+    f"{API_PREFIX}/air_quality/history/coordinates/{{parameter}}",
     response_model=List[TimeSeriesDataPoint],
     summary="Get Time Series History for a Location and Parameter",
-    description="Retrieves aggregated historical air quality data (e.g., 10-minute averages) for a specific parameter within a given geohash cell over a specified time window."
+    description="Retrieves aggregated historical air quality data (e.g., 10-minute averages) for a specific parameter at a geographic location over a specified time window."
 )
 async def get_location_history(
+    parameter: str = Path(..., description="The pollutant parameter to retrieve history for (e.g., 'pm25', 'no2')."),
+    lat: float = Query(..., ge=-90, le=90, description="Latitude of the location."),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude of the location."),
+    geohash_precision: int = Query(
+        5, # Default precision for history lookup
+        ge=2, # Minimum reasonable precision for this use case
+        le=7, # Maximum standard geohash precision for history
+        description="Geohash precision level to search within (1=large cell, 9=small cell). Determines the size of the grid cell for history retrieval."
+    ),
+    window: str = Query("24h", description="Time window to fetch history from (e.g., '1h', '24h', '7d'). Format: InfluxDB duration literal."),
+    aggregate: str = Query("10m", description="Aggregation window for the time series (e.g., '1m', '10m', '1h'). Format: InfluxDB duration literal.")
+):
+    """
+    Fetches time series data for a pollutant near the specified coordinates.
+    Uses geohash internally to determine the cell area.
+    """
+    logger.info(f"Request for history: coordinates=({lat},{lon}), parameter={parameter}, precision={geohash_precision}, window={window}, aggregate={aggregate}")
+
+    # Basic validation for parameters
+    valid_parameters = {'pm25', 'pm10', 'no2', 'so2', 'o3', 'co'}
+    if parameter not in valid_parameters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid parameter '{parameter}'. Valid parameters are: {', '.join(valid_parameters)}"
+        )
+    
+    # Convert coordinates to geohash
+    try:
+        geohash_str = geohash.encode(lat, lon, precision=geohash_precision)
+        logger.debug(f"Converted coordinates ({lat},{lon}) to geohash: {geohash_str} with precision {geohash_precision}")
+    except Exception as e:
+        logger.error(f"Error encoding coordinates to geohash: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error encoding coordinates to geohash: {str(e)}"
+        )
+
+    # Call existing query function with the calculated geohash
+    history_data = query_location_history(
+        geohash_str=geohash_str,
+        parameter=parameter,
+        window=window,
+        aggregate_window=aggregate
+    )
+
+    if not history_data:
+        logger.info(f"No history data found near coordinates ({lat},{lon}), geohash {geohash_str}, param {parameter}, window {window}.")
+        # Return empty list as per response_model=List[...]
+        return []
+
+    logger.info(f"Returning {len(history_data)} history points for coordinates ({lat},{lon}), geohash {geohash_str}, param {parameter}.")
+    return history_data
+
+
+# Keep the original geohash endpoint for backward compatibility
+@app.get(
+    f"{API_PREFIX}/air_quality/history/{{geohash_str}}/{{parameter}}",
+    response_model=List[TimeSeriesDataPoint],
+    summary="Get Time Series History for a Geohash and Parameter",
+    description="Retrieves aggregated historical air quality data for a specific parameter within a given geohash cell over a specified time window."
+)
+async def get_location_history_by_geohash(
     geohash_str: str = Path(..., description="The geohash string identifying the location cell.", min_length=1, max_length=12),
     parameter: str = Path(..., description="The pollutant parameter to retrieve history for (e.g., 'pm25', 'no2')."),
     window: str = Query("24h", description="Time window to fetch history from (e.g., '1h', '24h', '7d'). Format: InfluxDB duration literal."),

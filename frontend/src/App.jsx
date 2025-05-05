@@ -50,10 +50,15 @@ function App() {
     if (data?.geohash) {
       setIsLoadingHistory(true);
       const geohash = data.geohash;
+      console.log(`App: Fetching history for geohash ${geohash}`);
+      
       const parametersToFetch = ['pm25', 'pm10', 'no2', 'so2', 'o3']; // Parameters for history charts
       const historyPromises = parametersToFetch.map(param =>
         api.fetchLocationHistory(geohash, param, '24h', '10m') // Fetch 24h history, 10min aggregate
-          .then(history => ({ param, history }))
+          .then(history => {
+            console.log(`App: Received history for ${param}:`, history);
+            return { param, history };
+          })
           .catch(err => {
             console.error(`App: Failed to fetch history for ${param} at ${geohash}:`, err);
             // Store error per parameter or a general error
@@ -65,11 +70,21 @@ function App() {
       try {
         const results = await Promise.all(historyPromises);
         const newHistoryData = results.reduce((acc, { param, history }) => {
-          acc[param] = history;
+          // Ensure we have valid history array with proper timestamp and value properties
+          const validatedHistory = Array.isArray(history) ? 
+            history.filter(point => point && typeof point.timestamp === 'string' && typeof point.value === 'number') : 
+            [];
+          
+          acc[param] = validatedHistory;
           return acc;
         }, {});
+        
         setLocationHistoryData(newHistoryData);
-        console.log("App: Fetched history data:", newHistoryData);
+        console.log("App: Processed history data:", newHistoryData);
+        
+        // Check if we have any valid historical data points
+        const totalPoints = Object.values(newHistoryData).reduce((sum, arr) => sum + arr.length, 0);
+        console.log(`App: Total valid history data points: ${totalPoints}`);
       } catch (err) {
         console.error("App: Unexpected error fetching all history data:", err);
         setErrorHistory(prev => ({ ...prev, general: "An unexpected error occurred fetching history." }));

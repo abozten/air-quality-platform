@@ -327,9 +327,23 @@ const MapClickHandler = ({ selectedParam, onLocationDataLoaded }) => {
             popupRef.current.setContent(createPopupContent(data, selectedParam, lat, lng));
         }
 
+        // Fetch history data using coordinates instead of geohash
+        let historyData = null;
+        if (data) {
+          try {
+            // Use the coordinates-based endpoint for fetching history
+            historyData = await api.fetchLocationHistoryByCoordinates(
+              lat, lng, selectedParam, 5, '24h', '10m'
+            );
+            console.log(`MapClick: Received history data for ${selectedParam}:`, historyData);
+          } catch (historyError) {
+            console.error(`MapClick: Error fetching history data:`, historyError);
+          }
+        }
+
         // Call the callback function passed from parent (App.jsx)
         if (onLocationDataLoaded) {
-          onLocationDataLoaded(data); // Pass fetched data (can be null) upwards
+          onLocationDataLoaded(data, historyData); // Pass both data and history data upwards
         }
 
       } catch (error) {
@@ -340,7 +354,7 @@ const MapClickHandler = ({ selectedParam, onLocationDataLoaded }) => {
         }
          // Call callback with null on error
          if (onLocationDataLoaded) {
-          onLocationDataLoaded(null);
+          onLocationDataLoaded(null, null);
         }
       }
     }

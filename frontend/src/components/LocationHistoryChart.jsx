@@ -1,19 +1,19 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
-  CategoryScale, // Keep for time scale if using 'category' type
+  CategoryScale,
   LinearScale,
   PointElement,
   LineElement,
   Title,
   Tooltip,
   Legend,
-  TimeScale, // Import TimeScale
-  TimeSeriesScale // Import TimeSeriesScale
+  TimeScale,
+  TimeSeriesScale
 } from 'chart.js';
-import 'chartjs-adapter-date-fns'; // Import the date adapter
-import './PollutionChart.css'; // Reuse or create new CSS
+import 'chartjs-adapter-date-fns';
+import './PollutionChart.css';
 
 // Register necessary Chart.js components including TimeScale
 ChartJS.register(
@@ -24,11 +24,11 @@ ChartJS.register(
   Title,
   Tooltip,
   Legend,
-  TimeScale, // Register TimeScale
-  TimeSeriesScale // Register TimeSeriesScale
+  TimeScale,
+  TimeSeriesScale
 );
 
-// Mapping for display names and units (reuse from PollutionChart or define here)
+// Mapping for display names and units
 const POLLUTANT_NAMES = {
     pm25: 'PM 2.5',
     no2: 'NO₂',
@@ -37,9 +37,9 @@ const POLLUTANT_NAMES = {
     so2: 'SO₂',
     co: 'CO',
 };
-const POLLUTANT_UNITS = 'µg/m³'; // Assuming same unit for simplicity
+const POLLUTANT_UNITS = 'µg/m³';
 
-// Define colors (reuse from PollutionChart or define specific line colors)
+// Define colors for line charts
 const POLLUTANT_COLORS = {
   pm25: 'rgba(138, 43, 226, 0.8)', // Purple
   no2: 'rgba(76, 175, 80, 0.8)',  // Green
@@ -50,26 +50,49 @@ const POLLUTANT_COLORS = {
 };
 
 const LocationHistoryChart = ({ historyData, parameter, geohash }) => {
+  const chartRef = useRef(null);
+  
+  // Debug logging to verify data
+  useEffect(() => {
+    console.log(`Chart for ${parameter} received data:`, historyData);
+  }, [historyData, parameter]);
+
   if (!historyData || historyData.length === 0) {
     return <div className="no-chart-data">No history data for {POLLUTANT_NAMES[parameter] || parameter}.</div>;
   }
 
-  const chartLabels = historyData.map(point => new Date(point.timestamp)); // Use Date objects for time scale
-  const chartValues = historyData.map(point => point.value);
-  const color = POLLUTANT_COLORS[parameter] || 'rgba(201, 203, 207, 0.8)'; // Default grey
+  // Make sure all data points have properly formatted timestamps
+  const validData = historyData.filter(point => 
+    point && point.timestamp && !isNaN(new Date(point.timestamp).getTime()) && 
+    typeof point.value === 'number'
+  );
+
+  if (validData.length === 0) {
+    return <div className="no-chart-data">Invalid data format for {POLLUTANT_NAMES[parameter] || parameter} history.</div>;
+  }
+
+  // Sort data by timestamp to ensure proper visualization
+  const sortedData = [...validData].sort((a, b) => 
+    new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+
+  const chartLabels = sortedData.map(point => new Date(point.timestamp));
+  const chartValues = sortedData.map(point => point.value);
+  const color = POLLUTANT_COLORS[parameter] || 'rgba(201, 203, 207, 0.8)';
 
   const chartData = {
-    labels: chartLabels, // Use Date objects as labels
+    labels: chartLabels,
     datasets: [
       {
         label: `${POLLUTANT_NAMES[parameter] || parameter} (${POLLUTANT_UNITS})`,
         data: chartValues,
         borderColor: color,
-        backgroundColor: color.replace('0.8', '0.3'), // Lighter fill
-        tension: 0.1, // Slight curve to the line
-        pointRadius: 2, // Smaller points
+        backgroundColor: color.replace('0.8', '0.3'),
+        tension: 0.1,
+        pointRadius: 2,
         pointHoverRadius: 4,
         fill: true,
+        parsing: false, // For performance when working with timestamps directly
       },
     ],
   };
@@ -79,18 +102,18 @@ const LocationHistoryChart = ({ historyData, parameter, geohash }) => {
     maintainAspectRatio: false,
     plugins: {
       legend: {
-        display: true, // Show legend for line charts
+        display: true,
         position: 'top',
-         labels: {
-             color: '#ccc' // Legend text color
-         }
+        labels: {
+          color: '#ccc'
+        }
       },
       title: {
         display: true,
         text: `${POLLUTANT_NAMES[parameter] || parameter} Trend for ${geohash}`,
-        color: '#eee', // Title color
+        color: '#eee',
         font: {
-            size: 14
+          size: 14
         }
       },
       tooltip: {
@@ -127,35 +150,38 @@ const LocationHistoryChart = ({ historyData, parameter, geohash }) => {
         },
       },
       x: {
-        type: 'time', // Set scale type to 'time'
+        type: 'time',
         time: {
-          unit: 'hour', // Adjust based on data range (e.g., 'minute', 'day')
-          tooltipFormat: 'PPp', // Format for tooltip (e.g., 'May 5, 2025, 1:30 PM')
+          unit: 'hour',
+          tooltipFormat: 'PPpp', // More precise format for tooltip
           displayFormats: {
-             hour: 'HH:mm' // Format for axis labels (e.g., '14:00')
+            hour: 'HH:mm'
           }
         },
         title: {
-            display: true,
-            text: 'Time',
-            color: '#ccc'
+          display: true,
+          text: 'Time',
+          color: '#ccc'
         },
         ticks: {
           color: '#ccc',
-          maxRotation: 0, // Prevent label rotation
-          autoSkip: true, // Automatically skip labels to prevent overlap
-          maxTicksLimit: 6 // Limit the number of ticks shown
+          maxRotation: 0,
+          autoSkip: true,
+          maxTicksLimit: 6
         },
         grid: {
           display: false,
         },
       }
     },
+    animation: {
+      duration: 800 // Smoother animation
+    }
   };
 
   return (
-    <div className="location-history-chart-container">
-      <Line options={chartOptions} data={chartData} />
+    <div className="location-history-chart-container" style={{ height: '250px', width: '100%', position: 'relative', display: 'block', marginBottom: '20px' }}>
+      <Line ref={chartRef} options={chartOptions} data={chartData} />
     </div>
   );
 };

@@ -740,7 +740,7 @@ def query_location_history(
           |> aggregateWindow(every: {aggregate_window}, fn: mean, createEmpty: false)
           |> yield(name: "mean_values")
     '''
-    logger.debug(f"Executing Flux query for location history:\\n{flux_query}")
+    logger.info(f"Executing Flux query for location history:\\n{flux_query}")
 
     results: List[TimeSeriesDataPoint] = []
     try:

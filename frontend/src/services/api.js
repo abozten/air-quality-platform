@@ -127,6 +127,35 @@ export const fetchLocationHistory = async (geohash, parameter, window = '24h', a
   }
 };
 
+// --- Fetch location history using coordinates ---
+/**
+ * Fetches historical time series data for a specific parameter at the given coordinates
+ * @param {number} lat Latitude
+ * @param {number} lon Longitude
+ * @param {string} parameter The pollutant parameter to fetch history for (e.g., 'pm25', 'no2')
+ * @param {number} precision Geohash precision to use (determines cell size)
+ * @param {string} window Time window to look back (e.g., '24h', '7d')
+ * @param {string} aggregate Aggregation time window (e.g., '10m', '1h')
+ * @returns {Promise<Array<TimeSeriesDataPoint>>} Array of time series data points
+ */
+export const fetchLocationHistoryByCoordinates = async (lat, lon, parameter, precision = 5, window = '24h', aggregate = '10m') => {
+  if (lat === undefined || lon === undefined || !parameter) {
+    console.error("Missing required parameters for history request");
+    return [];
+  }
+  
+  const params = new URLSearchParams({
+    lat: lat,
+    lon: lon,
+    geohash_precision: precision,
+    window: window,
+    aggregate: aggregate
+  });
+  
+  console.log(`API: Fetching history data for ${parameter} at (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
+  const response = await fetch(`${API_BASE_URL}/air_quality/history/coordinates/${parameter}?${params.toString()}`);
+  return handleResponse(response);
+};
 
 // Fetch pollution density for a specific bounding box region
 export const fetchPollutionDensity = async (minLat, maxLat, minLon, maxLon, window = '24h') => {
