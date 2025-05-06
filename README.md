@@ -139,14 +139,13 @@ API endpoint'lerinin tam listesi ve detayları (istek/yanıt modelleri, parametr
 
 Proje kök dizininde bulunan bazı yardımcı script'ler ve dosyalar:
 
-*   **`fast_ingest.cpp`:** (Derlenmiş hali varsa) Muhtemelen C++ ile yazılmış, yüksek hızda veri gönderme testi yapmak için kullanılan bir istemci. Kullanımı için derlenmesi ve çalıştırılması gerekir. Parametreleri (hedef API URL'si, gönderilecek veri sayısı vb.) kaynak koduna bakarak veya `-h`/`--help` argümanı ile (eğer implemente edilmişse) öğrenilebilir.
-    *   Derleme (örnek): `g++ fast_ingest.cpp -o fast_ingest -lcurl` (libcurl kütüphanesi gerekebilir)
+*   **`fast_ingest.cpp`:** (Derlenmiş hali varsa) C++ ile yazılmış, yüksek hızda veri gönderme testi yapmak için kullanılan bir istemci. Kullanımı için derlenmesi ve çalıştırılması gerekir. Parametreleri (hedef API URL'si, gönderilecek veri sayısı vb.) kaynak koduna bakarak öğrenilebilir.
+    *   Derleme (örnek): `g++ fast_ingest.cpp -o fast_ingest -lcurl` (libcurl kütüphanesi gerekir)
     *   Çalıştırma (örnek): `./fast_ingest http://localhost:8000/api/v1/air_quality/ingest 1000`
-*   **`manual-input.sh`:** Manuel olarak tek bir veri noktası göndermek için kullanılabilecek bir shell script'i olabilir. İçeriğini inceleyerek nasıl kullanılacağını ve hangi parametreleri aldığını (örn. enlem, boylam, değerler) anlayabilirsiniz. Genellikle `curl` komutunu sarmalar.
+*   **`manual-input.sh`:** Manuel olarak tek bir veri noktası göndermek için kullanılabilecek bir shell script'i . İçeriğini inceleyerek nasıl kullanılacağını ve hangi parametreleri aldığını (örn. enlem, boylam, değerler) anlayabilirsiniz. `curl` komutunu sarmalar.
     *   Kullanım (örnek): `./manual-input.sh 41.01 28.97 22.5 35.1`
-*   **`auto-test.sh` / `turkey.sh` / `etst.sh`:** Otomatik testler, belirli senaryoları çalıştırmak (örn. Türkiye için veri gönderme) veya başka geliştirme/test görevleri için kullanılan script'ler olabilir. İçeriklerini inceleyerek amaçlarını ve kullanımlarını öğrenin.
 
-**Not:** Bu script'lerin güncelliği ve işlevselliği garanti edilmez. Kullanmadan önce içeriklerini kontrol edin.
+
 
 ## Sorun Giderme (Troubleshooting)
 
