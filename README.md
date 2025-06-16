@@ -52,7 +52,7 @@ Platform, aşağıdaki ana bileşenlerden oluşan bir mikroservis mimarisine sah
 
 1.  **Depoyu Klonlama:**
     ```bash
-    git clone https://github.com/abozten/air-quality-platform-kartaca/ # Depo URL'sini güncelleyin
+    git clone https://github.com/abozten/air-quality-platform/ # Depo URL'sini güncelleyin
     cd air-quality-platform
     ```
 
